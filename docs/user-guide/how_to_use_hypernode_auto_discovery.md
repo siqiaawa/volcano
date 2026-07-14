@@ -93,6 +93,65 @@ data:
       * `topologyA3`: The network topology type of A3(Ascend 910C) cluster. 
         * `nodeLabel`: For the labels on a node, when there are multiple labels, hypernodes are constructed from bottom to top. The bottommost label is kubernetes.io/hostname, which is a standard built-in label key in Kubernetes, and the label above it is volcano.sh/hypernode and volcano.sh/hypercluster, volcano.sh/hypernode indicates which hypernode a node belongs to, volcano.sh/hypercluster indicates which hypercluster a node belongs to.
 
+##### Mixed topology profiles
+
+Clusters that contain multiple topology structures should use the profile form of
+`networkTopologyTypes`. A profile separates the node label used to identify a
+physical network domain (`nodeLabel`) from the semantic boundary exposed to the
+scheduler (`tierName`). A node must match exactly one profile.
+
+The following configuration generates independent A3 and A5 HyperNode trees. It
+allows `highestTierName: volcano.sh/hypernode` to select tier 1 in A3 and tier 2
+in A5:
+
+```yaml
+networkTopologyDiscovery:
+  - source: label
+    enabled: true
+    config:
+      networkTopologyTypes:
+        topologyA3:
+          nodeSelector:
+            matchLabels:
+              volcano.sh/network-topology-profile: a3
+          levels:
+            - nodeLabel: volcano.sh/a3-hypercluster
+              tierName: volcano.sh/hypercluster
+            - nodeLabel: volcano.sh/a3-hypernode
+              tierName: volcano.sh/hypernode
+            - nodeLabel: kubernetes.io/hostname
+        topologyA5:
+          nodeSelector:
+            matchLabels:
+              volcano.sh/network-topology-profile: a5
+          levels:
+            - nodeLabel: volcano.sh/a5-hypercluster
+              tierName: volcano.sh/hypercluster
+            - nodeLabel: volcano.sh/a5-hypernode
+              tierName: volcano.sh/hypernode
+            - nodeLabel: volcano.sh/a5-superpod
+              tierName: volcano.sh/superpod
+            - nodeLabel: kubernetes.io/hostname
+```
+
+`levels` are declared from the highest network domain to the node level. The
+last entry identifies the node leaf and does not create a HyperNode. The other
+entries are converted to HyperNode tiers from bottom to top, starting at tier 1.
+
+The discoverer adds `volcano.sh/network-topology-profile` to every generated
+HyperNode and scopes domain identity by profile. Two profiles can therefore use
+the same domain label and value without merging their HyperNodes. If selectors
+overlap, a selected node is missing a configured level, or a child domain maps
+to multiple parents, discovery fails without publishing a partial topology.
+
+The legacy list form remains supported. It treats `nodeLabel` as both the domain
+label and `tierName`, and infers profile membership from the lowest topology
+label. Explicit `nodeSelector` profiles are recommended for mixed clusters.
+
+This configuration creates separate real roots for A3 and A5. The scheduler
+connects those roots through its in-memory cluster root; the controller does not
+create a virtual-root HyperNode resource.
+
         *       tier2                     s4                                 s5                         
                                   /               \                   /              \                 
                 tier1           s0                s1                 s2              s3              

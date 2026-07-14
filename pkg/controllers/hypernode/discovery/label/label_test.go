@@ -18,10 +18,13 @@ package label
 
 import (
 	"context"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -507,6 +510,246 @@ func expectedNodeForTest5() map[string]*corev1.Node {
 			},
 		},
 	}
+}
+
+func TestGenerateHyperNodesWithMixedTopologyProfiles(t *testing.T) {
+	const (
+		profileLabel    = "example.com/topology-profile"
+		hyperCluster    = "volcano.sh/hypercluster"
+		hyperNode       = "volcano.sh/hypernode"
+		superPod        = "volcano.sh/superpod"
+		hyperNodeKey    = "example.com/hypernode-domain"
+		hyperClusterKey = "example.com/hypercluster-domain"
+	)
+
+	cfg := api.DiscoveryConfig{
+		Source: "label",
+		Config: map[string]interface{}{
+			"networkTopologyTypes": map[string]interface{}{
+				"topologyA3": map[string]interface{}{
+					"nodeSelector": map[string]interface{}{
+						"matchLabels": map[string]interface{}{profileLabel: "a3"},
+					},
+					"levels": []interface{}{
+						map[string]interface{}{"nodeLabel": hyperClusterKey, "tierName": hyperCluster},
+						map[string]interface{}{"nodeLabel": hyperNodeKey, "tierName": hyperNode},
+						map[string]interface{}{"nodeLabel": "kubernetes.io/hostname"},
+					},
+				},
+				"topologyA5": map[string]interface{}{
+					"nodeSelector": map[string]interface{}{
+						"matchLabels": map[string]interface{}{profileLabel: "a5"},
+					},
+					"levels": []interface{}{
+						map[string]interface{}{"nodeLabel": hyperClusterKey, "tierName": hyperCluster},
+						map[string]interface{}{"nodeLabel": hyperNodeKey, "tierName": hyperNode},
+						map[string]interface{}{"nodeLabel": "example.com/superpod-domain", "tierName": superPod},
+						map[string]interface{}{"nodeLabel": "kubernetes.io/hostname"},
+					},
+				},
+			},
+		},
+	}
+	nodes := []*corev1.Node{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "a3-node", Labels: map[string]string{
+				profileLabel: "a3", hyperNodeKey: "hn-0", hyperClusterKey: "hc-0",
+			}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "a5-node", Labels: map[string]string{
+				profileLabel: "a5", hyperNodeKey: "hn-0", hyperClusterKey: "hc-0",
+				"example.com/superpod-domain": "sp-0",
+			}},
+		},
+	}
+
+	discoverer := newDiscovererForGenerationTest(t, cfg, nodes)
+	infoMap, err := discoverer.generateHyperNodeInfo()
+	require.NoError(t, err)
+	require.Len(t, infoMap, 5)
+
+	// Rebuilding from the same desired state must produce stable names and
+	// graph content even though networkTopologyTypes is backed by a Go map.
+	secondInfoMap, err := discoverer.generateHyperNodeInfo()
+	require.NoError(t, err)
+	assert.Equal(t, infoMap, secondInfoMap)
+
+	byProfileTier := make(map[string]map[int]*topologyv1alpha1.HyperNode)
+	for _, hn := range discoverer.buildHyperNodes(infoMap) {
+		profile := hn.Labels[api.NetworkTopologyProfileLabelKey]
+		if byProfileTier[profile] == nil {
+			byProfileTier[profile] = make(map[int]*topologyv1alpha1.HyperNode)
+		}
+		require.Nil(t, byProfileTier[profile][hn.Spec.Tier], "fixture expects one domain per profile tier")
+		byProfileTier[profile][hn.Spec.Tier] = hn
+	}
+
+	require.Len(t, byProfileTier["topologya3"], 2)
+	require.Len(t, byProfileTier["topologya5"], 3)
+	assert.Equal(t, hyperNode, byProfileTier["topologya3"][1].Spec.TierName)
+	assert.Equal(t, hyperCluster, byProfileTier["topologya3"][2].Spec.TierName)
+	assert.Equal(t, superPod, byProfileTier["topologya5"][1].Spec.TierName)
+	assert.Equal(t, hyperNode, byProfileTier["topologya5"][2].Spec.TierName)
+	assert.Equal(t, hyperCluster, byProfileTier["topologya5"][3].Spec.TierName)
+
+	// A3 and A5 intentionally reuse the same domain key/value. Profile-scoped
+	// identity must still create independent HyperNodes at different tiers.
+	a3HyperNode := byProfileTier["topologya3"][1]
+	a5HyperNode := byProfileTier["topologya5"][2]
+	assert.Equal(t, "hn-0", a3HyperNode.Labels[hyperNodeKey])
+	assert.Equal(t, "hn-0", a5HyperNode.Labels[hyperNodeKey])
+	assert.NotEqual(t, a3HyperNode.Name, a5HyperNode.Name)
+	assert.Equal(t, []string{"a3-node"}, exactMemberNames(a3HyperNode))
+	assert.Equal(t, []string{"a5-node"}, exactMemberNames(byProfileTier["topologya5"][1]))
+	assert.Equal(t, []string{a5HyperNode.Name}, exactMemberNames(byProfileTier["topologya5"][3]))
+}
+
+func TestGenerateHyperNodesRejectsMultipleProfileMatches(t *testing.T) {
+	profile := func(levelLabel string) map[string]interface{} {
+		return map[string]interface{}{
+			"nodeSelector": map[string]interface{}{
+				"matchLabels": map[string]interface{}{"example.com/role": "compute"},
+			},
+			"levels": []interface{}{
+				map[string]interface{}{"nodeLabel": levelLabel, "tierName": "volcano.sh/hypernode"},
+				map[string]interface{}{"nodeLabel": "kubernetes.io/hostname"},
+			},
+		}
+	}
+	cfg := api.DiscoveryConfig{
+		Source: "label",
+		Config: map[string]interface{}{
+			"networkTopologyTypes": map[string]interface{}{
+				"topologyA3": profile("example.com/a3-hypernode"),
+				"topologyA5": profile("example.com/a5-hypernode"),
+			},
+		},
+	}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "ambiguous-node", Labels: map[string]string{
+		"example.com/role":         "compute",
+		"example.com/a3-hypernode": "a3-hn",
+		"example.com/a5-hypernode": "a5-hn",
+	}}}
+
+	discoverer := newDiscovererForGenerationTest(t, cfg, []*corev1.Node{node})
+	infoMap, err := discoverer.generateHyperNodeInfo()
+	require.ErrorContains(t, err, "matches multiple topology profiles")
+	assert.Empty(t, infoMap, "an ambiguous node must not publish a partial topology")
+}
+
+func TestGenerateHyperNodesRejectsMultipleParents(t *testing.T) {
+	cfg := api.DiscoveryConfig{Config: map[string]interface{}{
+		"networkTopologyTypes": map[string]interface{}{
+			"topologyA3": map[string]interface{}{
+				"nodeSelector": map[string]interface{}{
+					"matchLabels": map[string]interface{}{"example.com/profile": "a3"},
+				},
+				"levels": []interface{}{
+					map[string]interface{}{"nodeLabel": "example.com/hypercluster", "tierName": "volcano.sh/hypercluster"},
+					map[string]interface{}{"nodeLabel": "example.com/hypernode", "tierName": "volcano.sh/hypernode"},
+					map[string]interface{}{"nodeLabel": "kubernetes.io/hostname"},
+				},
+			},
+		},
+	}}
+	nodes := []*corev1.Node{
+		{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{
+			"example.com/profile": "a3", "example.com/hypernode": "hn-0", "example.com/hypercluster": "hc-0",
+		}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "node-b", Labels: map[string]string{
+			"example.com/profile": "a3", "example.com/hypernode": "hn-0", "example.com/hypercluster": "hc-1",
+		}}},
+	}
+
+	discoverer := newDiscovererForGenerationTest(t, cfg, nodes)
+	_, err := discoverer.generateHyperNodeInfo()
+	require.ErrorContains(t, err, "belongs to multiple parents")
+}
+
+func TestParseCfgRejectsDuplicateSemanticTierName(t *testing.T) {
+	cfg := api.DiscoveryConfig{Config: map[string]interface{}{
+		"networkTopologyTypes": map[string]interface{}{
+			"topologyA5": map[string]interface{}{
+				"levels": []interface{}{
+					map[string]interface{}{"nodeLabel": "example.com/cluster", "tierName": "volcano.sh/hypernode"},
+					map[string]interface{}{"nodeLabel": "example.com/hypernode", "tierName": "volcano.sh/hypernode"},
+					map[string]interface{}{"nodeLabel": "kubernetes.io/hostname"},
+				},
+			},
+		},
+	}}
+
+	_, _, err := parseCfg(cfg)
+	require.ErrorContains(t, err, "duplicate tierName")
+}
+
+func TestParseMixedTopologyProfilesFromYAML(t *testing.T) {
+	const configYAML = `
+networkTopologyDiscovery:
+  - source: label
+    enabled: true
+    config:
+      networkTopologyTypes:
+        topologyA3:
+          nodeSelector:
+            matchLabels:
+              volcano.sh/network-topology-profile: a3
+          levels:
+            - nodeLabel: volcano.sh/a3-hypercluster
+              tierName: volcano.sh/hypercluster
+            - nodeLabel: volcano.sh/a3-hypernode
+              tierName: volcano.sh/hypernode
+            - nodeLabel: kubernetes.io/hostname
+        topologyA5:
+          nodeSelector:
+            matchLabels:
+              volcano.sh/network-topology-profile: a5
+          levels:
+            - nodeLabel: volcano.sh/a5-hypercluster
+              tierName: volcano.sh/hypercluster
+            - nodeLabel: volcano.sh/a5-hypernode
+              tierName: volcano.sh/hypernode
+            - nodeLabel: volcano.sh/a5-superpod
+              tierName: volcano.sh/superpod
+            - nodeLabel: kubernetes.io/hostname
+`
+	config := &api.NetworkTopologyConfig{}
+	require.NoError(t, yaml.Unmarshal([]byte(configYAML), config))
+	require.Len(t, config.NetworkTopologyDiscovery, 1)
+
+	profiles, watchedKeys, err := parseCfg(config.NetworkTopologyDiscovery[0])
+	require.NoError(t, err)
+	require.Len(t, profiles, 2)
+	assert.Equal(t, "topologyA3", profiles[0].name)
+	assert.Equal(t, []NodeLabel{
+		{NodeLabel: "volcano.sh/a3-hypernode", TierName: "volcano.sh/hypernode"},
+		{NodeLabel: "volcano.sh/a3-hypercluster", TierName: "volcano.sh/hypercluster"},
+	}, profiles[0].levels)
+	assert.Contains(t, watchedKeys, "volcano.sh/network-topology-profile")
+	assert.Contains(t, watchedKeys, "volcano.sh/a5-superpod")
+}
+
+func newDiscovererForGenerationTest(t *testing.T, cfg api.DiscoveryConfig, nodes []*corev1.Node) *labelDiscoverer {
+	t.Helper()
+	discoverer, ok := NewLabelDiscoverer(cfg, fake.NewSimpleClientset(), vcclientset.NewSimpleClientset()).(*labelDiscoverer)
+	require.True(t, ok)
+	require.NoError(t, discoverer.configErr)
+	for _, node := range nodes {
+		require.NoError(t, discoverer.nodeInformer.Informer().GetIndexer().Add(node))
+	}
+	return discoverer
+}
+
+func exactMemberNames(hyperNode *topologyv1alpha1.HyperNode) []string {
+	names := make([]string, 0, len(hyperNode.Spec.Members))
+	for _, member := range hyperNode.Spec.Members {
+		if member.Selector.ExactMatch != nil {
+			names = append(names, member.Selector.ExactMatch.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func createHyperNode(vcClient vcclient.Interface, nodeMap map[string]*topologyv1alpha1.HyperNode) {
