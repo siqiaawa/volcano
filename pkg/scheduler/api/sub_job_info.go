@@ -85,13 +85,26 @@ func NewSubJobInfo(gid SubJobGID, uid SubJobID, job JobID, policy *scheduling.Su
 	return sji
 }
 
-// IsHardTopologyMode return whether the subJob's network topology mode is hard and also return the highest allowed tier
+// IsHardTopologyMode reports a numeric hard topology constraint and returns its
+// tier. Use HardTopologyConstraint when tier names are supported by the caller.
 func (sji *SubJobInfo) IsHardTopologyMode() (bool, int) {
 	if sji.NetworkTopology == nil || sji.NetworkTopology.HighestTierAllowed == nil {
 		return false, 0
 	}
 
 	return sji.NetworkTopology.Mode == scheduling.HardNetworkTopologyMode, *sji.NetworkTopology.HighestTierAllowed
+}
+
+// HardTopologyConstraint returns the complete hard topology constraint. Tier
+// names are resolved within the candidate topology branch by the scheduler.
+func (sji *SubJobInfo) HardTopologyConstraint() *scheduling.NetworkTopologySpec {
+	if sji.NetworkTopology == nil || sji.NetworkTopology.Mode != scheduling.HardNetworkTopologyMode {
+		return nil
+	}
+	if sji.NetworkTopology.HighestTierAllowed == nil && sji.NetworkTopology.HighestTierName == "" {
+		return nil
+	}
+	return sji.NetworkTopology
 }
 
 // IsSoftTopologyMode returns whether the subJob has configured network topologies with soft mode.

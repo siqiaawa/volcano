@@ -3404,6 +3404,170 @@ func Test_batchNodeOrderFnForNormalPods(t *testing.T) {
 	}
 }
 
+func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
+	const (
+		hyperNodeTierName    = "volcano.sh/hypernode"
+		hyperClusterTierName = "volcano.sh/hypercluster"
+		superPodTierName     = "volcano.sh/superpod"
+	)
+
+	newHyperNodeInfo := func(name string, tier int, tierName string, children ...string) *api.HyperNodeInfo {
+		members := make([]api.MemberConfig, 0, len(children))
+		for _, child := range children {
+			members = append(members, api.MemberConfig{
+				Name:     child,
+				Type:     topologyv1alpha1.MemberTypeHyperNode,
+				Selector: "exact",
+			})
+		}
+
+		hyperNode := api.BuildHyperNode(name, tier, members)
+		hyperNode.Spec.TierName = tierName
+		info := api.NewHyperNodeInfo(hyperNode)
+		info.Children.Insert(children...)
+		return info
+	}
+
+	hyperNodes := api.HyperNodeInfoMap{
+		// A3 has two topology tiers: hypernode -> hypercluster.
+		"a3-hypernode-0": newHyperNodeInfo("a3-hypernode-0", 1, hyperNodeTierName),
+		"a3-hypernode-1": newHyperNodeInfo("a3-hypernode-1", 1, hyperNodeTierName),
+		"a3-hypercluster": newHyperNodeInfo(
+			"a3-hypercluster", 2, hyperClusterTierName, "a3-hypernode-0", "a3-hypernode-1"),
+
+		// A5 inserts superpod below hypernode, shifting the same semantic tiers up by one.
+		"a5-superpod-0": newHyperNodeInfo("a5-superpod-0", 1, superPodTierName),
+		"a5-superpod-1": newHyperNodeInfo("a5-superpod-1", 1, superPodTierName),
+		"a5-hypernode": newHyperNodeInfo(
+			"a5-hypernode", 2, hyperNodeTierName, "a5-superpod-0", "a5-superpod-1"),
+		"a5-hypercluster": newHyperNodeInfo(
+			"a5-hypercluster", 3, hyperClusterTierName, "a5-hypernode"),
+		framework.ClusterTopHyperNode: newHyperNodeInfo(
+			framework.ClusterTopHyperNode, 4, "", "a3-hypercluster", "a5-hypercluster"),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+
+	networkTopology := &scheduling.NetworkTopologySpec{
+		Mode:            scheduling.HardNetworkTopologyMode,
+		HighestTierName: hyperNodeTierName,
+	}
+
+	plugin := &networkTopologyAwarePlugin{
+		hyperNodeResourceCache: make(map[string]*resourceStatus),
+	}
+	ssn := &framework.Session{HyperNodes: hyperNodes}
+
+	collectNames := func(gradients [][]*api.HyperNodeInfo) sets.Set[string] {
+		names := sets.New[string]()
+		for _, gradient := range gradients {
+			for _, hyperNode := range gradient {
+				names.Insert(hyperNode.Name)
+			}
+		}
+		return names
+	}
+
+	gradients, err := plugin.hyperNodeGradientFn(
+		ssn, hyperNodes[framework.ClusterTopHyperNode], networkTopology, "", nil, api.PurposeAllocate)
+	assert.NoError(t, err)
+	candidates := collectNames(gradients)
+
+	// highestTierName=hypernode has a different numeric tier in each topology.
+	// Correct behavior must honor the semantic boundary independently per subtree.
+	assert.True(t, candidates.Has("a3-hypernode-0"), "A3 hypernode tier should remain eligible")
+	assert.False(t, candidates.Has("a3-hypercluster"),
+		"A3 must not cross the hypernode boundary into hypercluster")
+	assert.True(t, candidates.Has("a5-hypernode"),
+		"A5 must allow its tier-2 hypernode even though A3 uses tier 1 for the same tier name")
+	assert.True(t, candidates.Has("a5-superpod-0"), "A5 descendants below the boundary should remain eligible")
+	assert.False(t, candidates.Has("a5-hypercluster"),
+		"A5 must not cross the hypernode boundary into hypercluster")
+
+	t.Run("branch without requested tier name is excluded", func(t *testing.T) {
+		topology := &scheduling.NetworkTopologySpec{
+			Mode:            scheduling.HardNetworkTopologyMode,
+			HighestTierName: superPodTierName,
+		}
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
+		assert.NoError(t, err)
+		candidates := collectNames(gradients)
+		assert.True(t, candidates.Has("a5-superpod-0"))
+		assert.False(t, candidates.Has("a3-hypernode-0"))
+		assert.False(t, candidates.Has("a3-hypercluster"))
+	})
+
+	t.Run("partially running job resolves boundary from allocated branch", func(t *testing.T) {
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], networkTopology, "a5-superpod-0", nil, api.PurposeAllocate)
+		assert.NoError(t, err)
+		candidates := collectNames(gradients)
+		assert.True(t, candidates.Has("a5-hypernode"))
+		assert.True(t, candidates.Has("a5-superpod-1"))
+		assert.False(t, candidates.Has("a5-hypercluster"))
+		assert.False(t, candidates.Has("a3-hypernode-0"))
+	})
+
+	t.Run("real shared root keeps branch-local boundaries", func(t *testing.T) {
+		originalTop := hyperNodes[framework.ClusterTopHyperNode]
+		originalA3Parent := hyperNodes["a3-hypercluster"].Parent
+		originalA5Parent := hyperNodes["a5-hypercluster"].Parent
+		hyperNodes["fabric-root"] = newHyperNodeInfo(
+			"fabric-root", 4, "volcano.sh/fabric", "a3-hypercluster", "a5-hypercluster")
+		hyperNodes[framework.ClusterTopHyperNode] = newHyperNodeInfo(
+			framework.ClusterTopHyperNode, 5, "", "fabric-root")
+		hyperNodes["fabric-root"].Parent = framework.ClusterTopHyperNode
+		hyperNodes["a3-hypercluster"].Parent = "fabric-root"
+		hyperNodes["a5-hypercluster"].Parent = "fabric-root"
+		defer func() {
+			hyperNodes[framework.ClusterTopHyperNode] = originalTop
+			hyperNodes["a3-hypercluster"].Parent = originalA3Parent
+			hyperNodes["a5-hypercluster"].Parent = originalA5Parent
+			delete(hyperNodes, "fabric-root")
+		}()
+
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], networkTopology, "", nil, api.PurposeAllocate)
+		assert.NoError(t, err)
+		candidates := collectNames(gradients)
+		assert.True(t, candidates.Has("a3-hypernode-0"))
+		assert.True(t, candidates.Has("a5-hypernode"))
+		assert.False(t, candidates.Has("fabric-root"))
+		assert.False(t, candidates.Has("a3-hypercluster"))
+		assert.False(t, candidates.Has("a5-hypercluster"))
+	})
+
+	t.Run("missing tier name fails closed", func(t *testing.T) {
+		topology := &scheduling.NetworkTopologySpec{
+			Mode:            scheduling.HardNetworkTopologyMode,
+			HighestTierName: "volcano.sh/not-found",
+		}
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
+		assert.Error(t, err)
+		assert.Nil(t, gradients)
+	})
+
+	t.Run("duplicate tier name in one ancestor chain is rejected", func(t *testing.T) {
+		originalName := hyperNodes["a5-superpod-0"].HyperNode.Spec.TierName
+		hyperNodes["a5-superpod-0"].HyperNode.Spec.TierName = hyperNodeTierName
+		duplicate := api.NewHyperNodeInfo(hyperNodes["a5-superpod-0"].HyperNode, api.ParentOpt("a5-hypernode"))
+		hyperNodes["a5-superpod-0"] = duplicate
+		defer func() {
+			hyperNodes["a5-superpod-0"].HyperNode.Spec.TierName = originalName
+		}()
+
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], networkTopology, "", nil, api.PurposeAllocate)
+		assert.Error(t, err)
+		assert.Nil(t, gradients)
+	})
+}
+
 // TestHyperNodeGradientPreFiltering tests the pre-filtering logic in hyperNodeGradientFn.
 // It verifies HyperNodes are correctly filtered for allocation and eviction purposes.
 func TestHyperNodeGradientPreFiltering(t *testing.T) {
@@ -3720,7 +3884,7 @@ func TestHyperNodeGradientPreFiltering(t *testing.T) {
 			result, err := plugin.hyperNodeGradientFn(
 				ssn,
 				hyperNodesMap[tier2HNName],
-				tt.highestAllowedTier,
+				&scheduling.NetworkTopologySpec{HighestTierAllowed: &tt.highestAllowedTier},
 				"",
 				tt.minResource,
 				tt.purpose,

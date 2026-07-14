@@ -2080,7 +2080,7 @@ func TestAllocateWithNetWorkTopologies(t *testing.T) {
 			MinimalBindCheck: true,
 		},
 		{
-			Name: "hard network topology with highestTierName constrain and tasks in job rescheduled, can allocate job when here is no corresponding highestTierAllowed for highestTierName",
+			Name: "hard network topology with missing highestTierName remains pending",
 			PodGroups: []*schedulingv1.PodGroup{
 				util.BuildPodGroupUsingNetWorkTopologiesWithTierName("pg1", "c1", "s0", "q1", 2, nil, schedulingv1.PodGroupInqueue, "hard", "volcano.sh/hypercluster"),
 			},
@@ -2131,7 +2131,7 @@ func TestAllocateWithNetWorkTopologies(t *testing.T) {
 			Queues: []*schedulingv1.Queue{
 				util.BuildQueue("q1", 1, nil),
 			},
-			ExpectBindsNum:   1,
+			ExpectBindsNum:   0,
 			MinimalBindCheck: true,
 		},
 	}

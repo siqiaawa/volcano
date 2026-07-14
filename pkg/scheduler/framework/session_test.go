@@ -87,7 +87,7 @@ func TestSession_adjustNetworkTopologySpec(t *testing.T) {
 			},
 		},
 		{
-			name: "job with highestTierName, need translation",
+			name: "job with highestTierName is preserved for branch resolution",
 			jobs: map[api.JobID]*api.JobInfo{
 				"test-uid": {
 					PodGroup: &api.PodGroup{
@@ -128,14 +128,14 @@ func TestSession_adjustNetworkTopologySpec(t *testing.T) {
 						PodGroup: scheduling.PodGroup{
 							Spec: scheduling.PodGroupSpec{
 								NetworkTopology: &scheduling.NetworkTopologySpec{
-									HighestTierName:    "",
-									HighestTierAllowed: ptr.To(2),
+									HighestTierName:    "volcano.sh/hypercluster",
+									HighestTierAllowed: nil,
 								},
 								SubGroupPolicy: []scheduling.SubGroupPolicySpec{
 									{
 										NetworkTopology: &scheduling.NetworkTopologySpec{
-											HighestTierName:    "",
-											HighestTierAllowed: ptr.To(1),
+											HighestTierName:    "volcano.sh/hypernode",
+											HighestTierAllowed: nil,
 										},
 									},
 								},
@@ -145,8 +145,8 @@ func TestSession_adjustNetworkTopologySpec(t *testing.T) {
 					SubJobs: map[api.SubJobID]*api.SubJobInfo{
 						"test-uid": {
 							NetworkTopology: &scheduling.NetworkTopologySpec{
-								HighestTierName:    "",
-								HighestTierAllowed: ptr.To(1),
+								HighestTierName:    "volcano.sh/hypernode",
+								HighestTierAllowed: nil,
 							},
 						},
 					},
@@ -579,8 +579,8 @@ func TestConvertSoftToHardTopology_NilPodGroup(t *testing.T) {
 }
 
 func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
-	// This test verifies that adjustNetworkTopologySpec performs both tier name translation
-	// and soft→hard conversion in the same place.
+	// This test verifies that adjustNetworkTopologySpec converts soft mode while
+	// preserving hard tier names for branch-local resolution.
 	maxTier := 4 // ClusterTopHyperNode tier will be max(existing tiers) + 1 = 3 + 1 = 4
 
 	topHn := &topologyv1alpha1.HyperNode{}
@@ -594,9 +594,10 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 		hyperNodes  api.HyperNodeInfoMap
 		wantJobMode scheduling.NetworkTopologyMode
 		wantJobTier *int
+		wantJobName string
 	}{
 		{
-			name: "soft topology with tierName: both translated and converted",
+			name: "soft topology with tierName is converted to an unrestricted numeric boundary",
 			jobs: map[api.JobID]*api.JobInfo{
 				"test-uid": {
 					PodGroup: &api.PodGroup{
@@ -619,7 +620,6 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 			hyperNodes: api.HyperNodeInfoMap{
 				ClusterTopHyperNode: api.NewHyperNodeInfo(topHn),
 			},
-			// tierName is translated first (HighestTierAllowed=2), then soft→hard uses that tier
 			wantJobMode: scheduling.HardNetworkTopologyMode,
 			wantJobTier: ptr.To(maxTier),
 		},
@@ -647,7 +647,7 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 			wantJobTier: ptr.To(maxTier),
 		},
 		{
-			name: "hard topology with tierName: only translated, not re-converted",
+			name: "hard topology with tierName is preserved",
 			jobs: map[api.JobID]*api.JobInfo{
 				"test-uid": {
 					PodGroup: &api.PodGroup{
@@ -671,7 +671,8 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 				ClusterTopHyperNode: api.NewHyperNodeInfo(topHn),
 			},
 			wantJobMode: scheduling.HardNetworkTopologyMode,
-			wantJobTier: ptr.To(1), // translated from tierName, not overwritten by maxTier
+			wantJobTier: nil,
+			wantJobName: "volcano.sh/hypernode",
 		},
 	}
 
@@ -692,6 +693,7 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 			gotJob := ssn.Jobs["test-uid"]
 			assert.Equal(t, tt.wantJobMode, gotJob.NetworkTopology.Mode, "job mode mismatch")
 			assert.Equal(t, tt.wantJobTier, gotJob.NetworkTopology.HighestTierAllowed, "job tier mismatch")
+			assert.Equal(t, tt.wantJobName, gotJob.NetworkTopology.HighestTierName, "job tier name mismatch")
 		})
 	}
 }

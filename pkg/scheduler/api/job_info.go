@@ -1235,13 +1235,27 @@ func (ji *JobInfo) HasPendingTasks() bool {
 	return len(ji.TaskStatusIndex[Pending]) != 0
 }
 
-// IsHardTopologyMode return whether the job's network topology mode is hard and also return the highest allowed tier
+// IsHardTopologyMode reports a numeric hard topology constraint and returns its
+// tier. Use HardTopologyConstraint when tier names are supported by the caller.
 func (ji *JobInfo) IsHardTopologyMode() (bool, int) {
 	if ji.NetworkTopology == nil || ji.NetworkTopology.HighestTierAllowed == nil {
 		return false, 0
 	}
 
 	return ji.NetworkTopology.Mode == scheduling.HardNetworkTopologyMode, *ji.NetworkTopology.HighestTierAllowed
+}
+
+// HardTopologyConstraint returns the complete hard topology constraint. Tier
+// names are intentionally preserved because their numeric tier can differ
+// between topology branches.
+func (ji *JobInfo) HardTopologyConstraint() *scheduling.NetworkTopologySpec {
+	if ji.NetworkTopology == nil || ji.NetworkTopology.Mode != scheduling.HardNetworkTopologyMode {
+		return nil
+	}
+	if ji.NetworkTopology.HighestTierAllowed == nil && ji.NetworkTopology.HighestTierName == "" {
+		return nil
+	}
+	return ji.NetworkTopology
 }
 
 // IsSoftTopologyMode returns whether the job has configured network topologies with soft mode.
@@ -1340,7 +1354,7 @@ func (ji *JobInfo) ContainsSubJobPolicy() bool {
 // ContainsHardTopologyInSubJob returns whether the subJobs in the job contain hard network topology
 func (ji *JobInfo) ContainsHardTopologyInSubJob() bool {
 	for _, subJob := range ji.SubJobs {
-		if hard, _ := subJob.IsHardTopologyMode(); hard {
+		if subJob.HardTopologyConstraint() != nil {
 			return true
 		}
 	}
@@ -1349,7 +1363,7 @@ func (ji *JobInfo) ContainsHardTopologyInSubJob() bool {
 
 // ContainsHardTopology returns whether the job and the subJobs in the job contain hard network topology
 func (ji *JobInfo) ContainsHardTopology() bool {
-	if hard, _ := ji.IsHardTopologyMode(); hard || ji.ContainsHardTopologyInSubJob() {
+	if ji.HardTopologyConstraint() != nil || ji.ContainsHardTopologyInSubJob() {
 		return true
 	}
 	return false
