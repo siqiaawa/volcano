@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -106,6 +107,8 @@ type labelDiscoverer struct {
 	completedCh          chan struct{}
 	queue                workqueue.TypedRateLimitingInterface[string]
 	hyperNodeLister      topologylisterv1alpha1.HyperNodeLister
+	stopOnce             sync.Once
+	workerWG             sync.WaitGroup
 }
 
 // Start begins the topology discovery process and returns the channel for receiving discovered topology
@@ -141,22 +144,32 @@ func (l *labelDiscoverer) Start() (chan []*topologyv1alpha1.HyperNode, error) {
 	l.enqueue()
 
 	// Start discovery in a separate goroutine
-	go l.work()
+	l.workerWG.Add(1)
+	go func() {
+		defer l.workerWG.Done()
+		defer close(l.outputCh)
+		l.work()
+	}()
 
 	return l.outputCh, nil
 }
 
 // Stop halts the discovery process
 func (l *labelDiscoverer) Stop() error {
-	close(l.outputCh)
-	close(l.stopCh)
-	l.queue.ShutDown()
+	l.stopOnce.Do(func() {
+		close(l.stopCh)
+		l.queue.ShutDown()
+	})
+	l.workerWG.Wait()
 	return nil
 }
 
 // ResultSynced notice the topology discovery results have been processed
 func (l *labelDiscoverer) ResultSynced() {
-	l.completedCh <- struct{}{}
+	select {
+	case l.completedCh <- struct{}{}:
+	case <-l.stopCh:
+	}
 }
 
 // Name returns the discoverer name
@@ -323,6 +336,9 @@ func checkLabels(labels []NodeLabel) error {
 		if label.NodeLabel == "" {
 			return errors.New("nodeLabel cannot be empty")
 		}
+		if validationErrors := validation.IsQualifiedName(label.NodeLabel); len(validationErrors) > 0 {
+			return fmt.Errorf("nodeLabel %q is not a valid qualified name: %s", label.NodeLabel, strings.Join(validationErrors, "; "))
+		}
 		if _, exist := seen[label.NodeLabel]; !exist {
 			seen[label.NodeLabel] = true
 			continue
@@ -380,8 +396,12 @@ func (l *labelDiscoverer) discovery() error {
 	// create HyperNodes
 	hyperNodes := l.buildHyperNodes(hyperNodeInfoMap)
 
-	// Send discovered nodes through the channel
-	l.outputCh <- hyperNodes
+	// Send discovered nodes through the channel unless shutdown has started.
+	select {
+	case l.outputCh <- hyperNodes:
+	case <-l.stopCh:
+		return nil
+	}
 
 	klog.InfoS("End label based hyperNode auto discovery")
 	return err
@@ -411,6 +431,12 @@ func (l *labelDiscoverer) buildHyperNodes(hyperNodeInfoMap map[string]HyperNodeI
 		// Add to the list for the hyperNode
 		hyperNodes = append(hyperNodes, hyperNode)
 	}
+	sort.Slice(hyperNodes, func(i, j int) bool {
+		if hyperNodes[i].Spec.Tier != hyperNodes[j].Spec.Tier {
+			return hyperNodes[i].Spec.Tier < hyperNodes[j].Spec.Tier
+		}
+		return hyperNodes[i].Name < hyperNodes[j].Name
+	})
 	return hyperNodes
 }
 
@@ -461,9 +487,9 @@ func (l *labelDiscoverer) DeleteHyperNode(obj interface{}) {
 // getLabelMap get the labelMap on the node used to construct the hyperNode
 func (l *labelDiscoverer) getNodeNetworkTopologyLabels(obj interface{}) map[string]string {
 	tempMap := make(map[string]string)
-	node, ok := obj.(*v1.Node)
-	if !ok {
-		klog.Errorf("Cannot convert to *v1.Node: %v", obj)
+	node, err := nodeFromInformerEvent(obj)
+	if err != nil {
+		klog.ErrorS(err, "Cannot get Node from informer event")
 		return tempMap
 	}
 	labelMap := node.Labels
@@ -474,6 +500,30 @@ func (l *labelDiscoverer) getNodeNetworkTopologyLabels(obj interface{}) map[stri
 		}
 	}
 	return tempMap
+}
+
+func nodeFromInformerEvent(obj interface{}) (*v1.Node, error) {
+	switch value := obj.(type) {
+	case *v1.Node:
+		return value, nil
+	case cache.DeletedFinalStateUnknown:
+		node, ok := value.Obj.(*v1.Node)
+		if !ok {
+			return nil, fmt.Errorf("tombstone contained object of type %T, expected *v1.Node", value.Obj)
+		}
+		return node, nil
+	case *cache.DeletedFinalStateUnknown:
+		if value == nil {
+			return nil, errors.New("received nil tombstone")
+		}
+		node, ok := value.Obj.(*v1.Node)
+		if !ok {
+			return nil, fmt.Errorf("tombstone contained object of type %T, expected *v1.Node", value.Obj)
+		}
+		return node, nil
+	default:
+		return nil, fmt.Errorf("cannot convert object of type %T to *v1.Node", obj)
+	}
 }
 
 func stringMapsEqual(a, b map[string]string) bool {

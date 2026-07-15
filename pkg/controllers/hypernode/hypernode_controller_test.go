@@ -18,8 +18,10 @@ package hypernode
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,8 +30,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/util/workqueue"
 
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
@@ -63,9 +67,6 @@ func (m *mockDiscoveryManager) Stop() {
 
 	m.stopCalled = true
 	close(m.resultCh)
-}
-
-func (m *mockDiscoveryManager) ResultSynced(source string) {
 }
 
 func (m *mockDiscoveryManager) ResultChannel() <-chan discovery.Result {
@@ -279,6 +280,8 @@ func TestInvalidLabelDiscoveryConfigPreservesLastValidTopology(t *testing.T) {
 	kubeClient := k8sfake.NewSimpleClientset(node)
 	vcClient := vcclientset.NewSimpleClientset()
 	vcInformerFactory := vcinformer.NewSharedInformerFactory(vcClient, 0)
+	hyperNodeInformer := vcInformerFactory.Topology().V1alpha1().HyperNodes()
+	_ = hyperNodeInformer.Informer()
 	stopInformers := make(chan struct{})
 	defer close(stopInformers)
 	vcInformerFactory.Start(stopInformers)
@@ -297,8 +300,8 @@ func TestInvalidLabelDiscoveryConfigPreservesLastValidTopology(t *testing.T) {
 
 	controller := &hyperNodeController{
 		vcClient:          vcClient,
-		hyperNodeInformer: vcInformerFactory.Topology().V1alpha1().HyperNodes(),
-		hyperNodeLister:   vcInformerFactory.Topology().V1alpha1().HyperNodes().Lister(),
+		hyperNodeInformer: hyperNodeInformer,
+		hyperNodeLister:   hyperNodeInformer.Lister(),
 	}
 	reconcileNextResult := func() string {
 		t.Helper()
@@ -306,8 +309,8 @@ func TestInvalidLabelDiscoveryConfigPreservesLastValidTopology(t *testing.T) {
 		case result := <-manager.ResultChannel():
 			require.Equal(t, "label", result.Source)
 			require.Len(t, result.HyperNodes, 1)
-			controller.reconcileTopology(result.Source, result.HyperNodes)
-			manager.ResultSynced(result.Source)
+			require.NoError(t, controller.reconcileTopology(result.Source, result.HyperNodes))
+			result.Ack()
 			return result.HyperNodes[0].Name
 		case <-time.After(5 * time.Second):
 			t.Fatal("timed out waiting for label discovery result")
@@ -336,6 +339,10 @@ func TestInvalidLabelDiscoveryConfigPreservesLastValidTopology(t *testing.T) {
 		hyperNodes := listHyperNodes()
 		return len(hyperNodes) == 1 && hyperNodes[0].Name == expectedName
 	}, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		hyperNodes, err := controller.hyperNodeLister.List(labels.Everything())
+		return err == nil && len(hyperNodes) == 1 && hyperNodes[0].Name == expectedName
+	}, 5*time.Second, 10*time.Millisecond, "the informer must observe the initial topology before testing its replacement")
 	deleteCountBeforeInvalidConfig := deleteActionCount()
 
 	loader.SetConfig(invalidConfig)
@@ -353,15 +360,282 @@ func TestInvalidLabelDiscoveryConfigPreservesLastValidTopology(t *testing.T) {
 	assert.Equal(t, expectedName, hyperNodesDuringError[0].Name)
 	assert.Equal(t, deleteCountBeforeInvalidConfig, deleteActionCount(), "invalid config must not delete the last valid topology")
 
+	updatedNode, err := kubeClient.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	updatedNode.Labels[domainKey] = "hn-1"
+	_, err = kubeClient.CoreV1().Nodes().Update(context.Background(), updatedNode, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	nameUpdatedByOldDiscoverer := reconcileNextResult()
+	assert.NotEqual(t, expectedName, nameUpdatedByOldDiscoverer,
+		"the old discoverer must continue processing Node updates while the replacement config is invalid")
+	require.Eventually(t, func() bool {
+		hyperNodes := listHyperNodes()
+		return len(hyperNodes) == 1 && hyperNodes[0].Name == nameUpdatedByOldDiscoverer
+	}, 5*time.Second, 10*time.Millisecond)
+	deleteCountAfterNodeUpdate := deleteActionCount()
+
 	loader.SetConfig(validConfig())
 	queue.Add(configKey)
 	recoveredName := reconcileNextResult()
-	assert.Equal(t, expectedName, recoveredName)
+	assert.Equal(t, nameUpdatedByOldDiscoverer, recoveredName)
 	require.Eventually(t, func() bool {
 		hyperNodes := listHyperNodes()
-		return len(hyperNodes) == 1 && hyperNodes[0].Name == expectedName
+		return len(hyperNodes) == 1 && hyperNodes[0].Name == nameUpdatedByOldDiscoverer
 	}, 5*time.Second, 10*time.Millisecond)
-	assert.Equal(t, deleteCountBeforeInvalidConfig, deleteActionCount())
+	assert.Equal(t, deleteCountAfterNodeUpdate, deleteActionCount(), "recovery must not replace an already current topology")
+}
+
+func TestDiscoveryResultRetriesBeforeAcknowledgement(t *testing.T) {
+	fakeVcClient := vcclientset.NewSimpleClientset()
+	vcInformerFactory := vcinformer.NewSharedInformerFactory(fakeVcClient, 0)
+	var createAttempts atomic.Int32
+	fakeVcClient.PrependReactor("create", "hypernodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if createAttempts.Add(1) == 1 {
+			return true, nil, errors.New("injected create failure")
+		}
+		return false, nil, nil
+	})
+
+	controller := &hyperNodeController{
+		vcClient:        fakeVcClient,
+		hyperNodeLister: vcInformerFactory.Topology().V1alpha1().HyperNodes().Lister(),
+		discoveryResultQueue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[*discovery.Result]()),
+	}
+	var acknowledgements atomic.Int32
+	result := &discovery.Result{
+		Source: "label",
+		HyperNodes: []*topologyv1alpha1.HyperNode{{
+			ObjectMeta: metav1.ObjectMeta{Name: "retry-tier-1"},
+			Spec:       topologyv1alpha1.HyperNodeSpec{Tier: 1},
+		}},
+		Acknowledge: func() {
+			acknowledgements.Add(1)
+		},
+	}
+
+	workerDone := make(chan struct{})
+	go func() {
+		controller.processDiscoveryResults()
+		close(workerDone)
+	}()
+	controller.discoveryResultQueue.Add(result)
+	require.Eventually(t, func() bool {
+		return createAttempts.Load() >= 2 && acknowledgements.Load() == 1
+	}, 3*time.Second, 10*time.Millisecond)
+	assert.Equal(t, int32(1), acknowledgements.Load(), "a failed reconcile must not acknowledge before its retry succeeds")
+	_, err := fakeVcClient.TopologyV1alpha1().HyperNodes().Get(
+		context.Background(), "retry-tier-1", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	controller.discoveryResultQueue.ShutDownWithDrain()
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("discovery result worker did not stop")
+	}
+}
+
+func TestDiscoveryResultRetriesUpdateAndDeleteBeforeAcknowledgement(t *testing.T) {
+	const source = "label"
+	existingHyperNode := func() *topologyv1alpha1.HyperNode {
+		return &topologyv1alpha1.HyperNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "existing", Labels: map[string]string{
+				api.NetworkTopologySourceLabelKey: source,
+			}},
+			Spec: topologyv1alpha1.HyperNodeSpec{Tier: 1},
+		}
+	}
+	runWorker := func(t *testing.T, controller *hyperNodeController, result *discovery.Result, completed func() bool) {
+		t.Helper()
+		workerDone := make(chan struct{})
+		go func() {
+			controller.processDiscoveryResults()
+			close(workerDone)
+		}()
+		controller.discoveryResultQueue.Add(result)
+		require.Eventually(t, completed, 3*time.Second, 10*time.Millisecond)
+		controller.discoveryResultQueue.ShutDownWithDrain()
+		select {
+		case <-workerDone:
+		case <-time.After(time.Second):
+			t.Fatal("discovery result worker did not stop")
+		}
+	}
+
+	t.Run("update", func(t *testing.T) {
+		existing := existingHyperNode()
+		fakeVcClient := vcclientset.NewSimpleClientset(existing.DeepCopy())
+		vcInformerFactory := vcinformer.NewSharedInformerFactory(fakeVcClient, 0)
+		hyperNodeInformer := vcInformerFactory.Topology().V1alpha1().HyperNodes()
+		require.NoError(t, hyperNodeInformer.Informer().GetIndexer().Add(existing.DeepCopy()))
+		var updateAttempts atomic.Int32
+		fakeVcClient.PrependReactor("update", "hypernodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if action.GetSubresource() == "" && updateAttempts.Add(1) == 1 {
+				return true, nil, errors.New("injected update failure")
+			}
+			return false, nil, nil
+		})
+		controller := &hyperNodeController{
+			vcClient:        fakeVcClient,
+			hyperNodeLister: hyperNodeInformer.Lister(),
+			discoveryResultQueue: workqueue.NewTypedRateLimitingQueue(
+				workqueue.DefaultTypedControllerRateLimiter[*discovery.Result]()),
+		}
+		var acknowledgements atomic.Int32
+		result := &discovery.Result{
+			Source: source, HyperNodes: []*topologyv1alpha1.HyperNode{existing.DeepCopy()},
+			Acknowledge: func() { acknowledgements.Add(1) },
+		}
+		runWorker(t, controller, result, func() bool {
+			return updateAttempts.Load() >= 2 && acknowledgements.Load() == 1
+		})
+		assert.Equal(t, int32(1), acknowledgements.Load())
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		existing := existingHyperNode()
+		fakeVcClient := vcclientset.NewSimpleClientset(existing.DeepCopy())
+		vcInformerFactory := vcinformer.NewSharedInformerFactory(fakeVcClient, 0)
+		hyperNodeInformer := vcInformerFactory.Topology().V1alpha1().HyperNodes()
+		require.NoError(t, hyperNodeInformer.Informer().GetIndexer().Add(existing.DeepCopy()))
+		var deleteAttempts atomic.Int32
+		fakeVcClient.PrependReactor("delete", "hypernodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+			if deleteAttempts.Add(1) == 1 {
+				return true, nil, errors.New("injected delete failure")
+			}
+			return false, nil, nil
+		})
+		controller := &hyperNodeController{
+			vcClient:        fakeVcClient,
+			hyperNodeLister: hyperNodeInformer.Lister(),
+			discoveryResultQueue: workqueue.NewTypedRateLimitingQueue(
+				workqueue.DefaultTypedControllerRateLimiter[*discovery.Result]()),
+		}
+		var acknowledgements atomic.Int32
+		result := &discovery.Result{
+			Source: source, HyperNodes: []*topologyv1alpha1.HyperNode{},
+			Acknowledge: func() { acknowledgements.Add(1) },
+		}
+		runWorker(t, controller, result, func() bool {
+			return deleteAttempts.Load() >= 2 && acknowledgements.Load() == 1
+		})
+		assert.Equal(t, int32(1), acknowledgements.Load())
+	})
+}
+
+func TestStaleDiscoveryResultIsAcknowledgedWithoutReconcile(t *testing.T) {
+	fakeVcClient := vcclientset.NewSimpleClientset()
+	vcInformerFactory := vcinformer.NewSharedInformerFactory(fakeVcClient, 0)
+	controller := &hyperNodeController{
+		vcClient:        fakeVcClient,
+		hyperNodeLister: vcInformerFactory.Topology().V1alpha1().HyperNodes().Lister(),
+		discoveryResultQueue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[*discovery.Result]()),
+	}
+	var acknowledgements atomic.Int32
+	result := &discovery.Result{
+		Source:     "label",
+		HyperNodes: []*topologyv1alpha1.HyperNode{{ObjectMeta: metav1.ObjectMeta{Name: "stale"}}},
+		Current:    func() bool { return false },
+		Acknowledge: func() {
+			acknowledgements.Add(1)
+		},
+	}
+
+	workerDone := make(chan struct{})
+	go func() {
+		controller.processDiscoveryResults()
+		close(workerDone)
+	}()
+	controller.discoveryResultQueue.Add(result)
+	require.Eventually(t, func() bool { return acknowledgements.Load() == 1 }, time.Second, 10*time.Millisecond)
+	assert.Empty(t, fakeVcClient.Actions())
+	controller.discoveryResultQueue.ShutDownWithDrain()
+	<-workerDone
+}
+
+func TestReconcileTopologyUsesDependencyOrder(t *testing.T) {
+	const source = "label"
+	newHyperNode := func(name string, tier int) *topologyv1alpha1.HyperNode {
+		return &topologyv1alpha1.HyperNode{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{
+				api.NetworkTopologySourceLabelKey: source,
+			}},
+			Spec: topologyv1alpha1.HyperNodeSpec{Tier: tier},
+		}
+	}
+	desired := []*topologyv1alpha1.HyperNode{
+		newHyperNode("tier-3", 3),
+		newHyperNode("tier-1", 1),
+		newHyperNode("tier-2", 2),
+	}
+
+	t.Run("create and update children before parents", func(t *testing.T) {
+		fakeVcClient := vcclientset.NewSimpleClientset()
+		vcInformerFactory := vcinformer.NewSharedInformerFactory(fakeVcClient, 0)
+		controller := &hyperNodeController{
+			vcClient:        fakeVcClient,
+			hyperNodeLister: vcInformerFactory.Topology().V1alpha1().HyperNodes().Lister(),
+		}
+		require.NoError(t, controller.reconcileTopology(source, desired))
+
+		var created []string
+		for _, action := range fakeVcClient.Actions() {
+			if action.GetVerb() != "create" || action.GetResource().Resource != "hypernodes" {
+				continue
+			}
+			created = append(created, action.(k8stesting.CreateAction).GetObject().(*topologyv1alpha1.HyperNode).Name)
+		}
+		assert.Equal(t, []string{"tier-1", "tier-2", "tier-3"}, created)
+	})
+
+	t.Run("update children before parents", func(t *testing.T) {
+		existing := []runtime.Object{desired[0].DeepCopy(), desired[1].DeepCopy(), desired[2].DeepCopy()}
+		fakeVcClient := vcclientset.NewSimpleClientset(existing...)
+		vcInformerFactory := vcinformer.NewSharedInformerFactory(fakeVcClient, 0)
+		hyperNodeInformer := vcInformerFactory.Topology().V1alpha1().HyperNodes()
+		for _, object := range existing {
+			require.NoError(t, hyperNodeInformer.Informer().GetIndexer().Add(object))
+		}
+		controller := &hyperNodeController{
+			vcClient:        fakeVcClient,
+			hyperNodeLister: hyperNodeInformer.Lister(),
+		}
+		require.NoError(t, controller.reconcileTopology(source, desired))
+
+		var updated []string
+		for _, action := range fakeVcClient.Actions() {
+			if action.GetVerb() != "update" || action.GetResource().Resource != "hypernodes" || action.GetSubresource() != "" {
+				continue
+			}
+			updated = append(updated, action.(k8stesting.UpdateAction).GetObject().(*topologyv1alpha1.HyperNode).Name)
+		}
+		assert.Equal(t, []string{"tier-1", "tier-2", "tier-3"}, updated)
+	})
+
+	t.Run("delete parents before children", func(t *testing.T) {
+		existing := []runtime.Object{desired[0].DeepCopy(), desired[1].DeepCopy(), desired[2].DeepCopy()}
+		fakeVcClient := vcclientset.NewSimpleClientset(existing...)
+		vcInformerFactory := vcinformer.NewSharedInformerFactory(fakeVcClient, 0)
+		hyperNodeInformer := vcInformerFactory.Topology().V1alpha1().HyperNodes()
+		for _, object := range existing {
+			require.NoError(t, hyperNodeInformer.Informer().GetIndexer().Add(object))
+		}
+		controller := &hyperNodeController{
+			vcClient:        fakeVcClient,
+			hyperNodeLister: hyperNodeInformer.Lister(),
+		}
+		require.NoError(t, controller.reconcileTopology(source, []*topologyv1alpha1.HyperNode{}))
+
+		var deleted []string
+		for _, action := range fakeVcClient.Actions() {
+			if action.GetVerb() == "delete" && action.GetResource().Resource == "hypernodes" {
+				deleted = append(deleted, action.(k8stesting.DeleteAction).GetName())
+			}
+		}
+		assert.Equal(t, []string{"tier-3", "tier-2", "tier-1"}, deleted)
+	})
 }
 
 func TestHyperNodeController_Initialize(t *testing.T) {

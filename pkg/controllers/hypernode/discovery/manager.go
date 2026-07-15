@@ -18,10 +18,11 @@ package discovery
 
 import (
 	"fmt"
+	"sort"
 	"sync"
+	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -41,6 +42,25 @@ type Result struct {
 	HyperNodes []*topologyv1alpha1.HyperNode
 	// Source indicates the source of the discovery
 	Source string
+	// Generation identifies the discoverer instance that produced this result.
+	Generation uint64
+	// Acknowledge notifies the producing discoverer after reconciliation succeeds.
+	Acknowledge func()
+	// Current reports whether this result still belongs to the active discoverer.
+	Current func() bool
+}
+
+// Ack acknowledges this result at most once when the manager supplied a callback.
+func (r Result) Ack() {
+	if r.Acknowledge != nil {
+		r.Acknowledge()
+	}
+}
+
+// IsCurrent reports whether the result is still current. Results constructed by
+// tests or external callers without a callback are treated as current.
+func (r Result) IsCurrent() bool {
+	return r.Current == nil || r.Current()
 }
 
 // Manager is the interface for managing network topology discovery
@@ -51,21 +71,37 @@ type Manager interface {
 	Stop()
 	// ResultChannel returns a channel for receiving discovery results
 	ResultChannel() <-chan Result
+}
 
-	// ResultSynced every time the Result in ResultChannel are processed, this method must be called to notify network topology discover
-	ResultSynced(source string)
+type discovererInstance struct {
+	source            string
+	generation        uint64
+	discoverer        api.Discoverer
+	outputCh          <-chan []*topologyv1alpha1.HyperNode
+	processorStopCh   chan struct{}
+	processorStopOnce sync.Once
+}
+
+func (d *discovererInstance) stopProcessor() {
+	d.processorStopOnce.Do(func() {
+		close(d.processorStopCh)
+	})
 }
 
 // manager manages network topology discovery processes
 type manager struct {
-	mutex sync.Mutex
+	mutex sync.RWMutex
 
 	configLoader config.Loader
 	config       *api.NetworkTopologyConfig
 
-	discoverers map[string]api.Discoverer
+	discoverers map[string]*discovererInstance
 	workQueue   workqueue.TypedRateLimitingInterface[string]
 	stopCh      chan struct{}
+	stopOnce    sync.Once
+	workerWG    sync.WaitGroup
+	processorWG sync.WaitGroup
+	generation  atomic.Uint64
 
 	kubeClient clientset.Interface
 	vcClient   vcclientset.Interface
@@ -77,7 +113,7 @@ type manager struct {
 func NewManager(configLoader config.Loader, queue workqueue.TypedRateLimitingInterface[string], kubeClient clientset.Interface, vcClient vcclientset.Interface) Manager {
 	return &manager{
 		configLoader: configLoader,
-		discoverers:  make(map[string]api.Discoverer),
+		discoverers:  make(map[string]*discovererInstance),
 		resultCh:     make(chan Result),
 		stopCh:       make(chan struct{}),
 		workQueue:    queue,
@@ -93,13 +129,21 @@ func (m *manager) Start() error {
 	if err != nil {
 		klog.ErrorS(err, "Failed to load config")
 		// Initialize with an empty config to avoid nil pointer dereference.
+		m.mutex.Lock()
 		m.config = &api.NetworkTopologyConfig{}
+		m.mutex.Unlock()
 		// Do not return an error here, in case of configMap is updated correctly later.
 	} else {
+		m.mutex.Lock()
 		m.config = cfg
+		m.mutex.Unlock()
 	}
 
-	go m.worker()
+	m.workerWG.Add(1)
+	go func() {
+		defer m.workerWG.Done()
+		m.worker()
+	}()
 
 	klog.InfoS("Network topology discovery manager started")
 	return nil
@@ -107,82 +151,64 @@ func (m *manager) Start() error {
 
 // Stop halts all discovery processes
 func (m *manager) Stop() {
-	close(m.stopCh)
-	m.stopAllDiscoverers()
-	klog.InfoS("Network topology discovery manager stopped")
-}
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+		m.workQueue.ShutDown()
+		m.workerWG.Wait()
 
-// ResultSynced every time the Result in ResultChannel are processed, this method must be called to notify network topology discover
-func (m *manager) ResultSynced(source string) {
-	discoverer, exists := m.discoverers[source]
-	if !exists {
-		klog.InfoS("No need to notice discoverer as it may not start yet", "source", source)
-		return
-	}
-	discoverer.ResultSynced()
-	klog.InfoS("notice discoverer Topology reconciliation completed", "source", source)
+		m.mutex.Lock()
+		instances := m.discoverers
+		m.discoverers = make(map[string]*discovererInstance)
+		m.mutex.Unlock()
+
+		m.stopInstances(instances)
+		m.processorWG.Wait()
+		close(m.resultCh)
+		klog.InfoS("Network topology discovery manager stopped")
+	})
 }
 
 func (m *manager) ResultChannel() <-chan Result {
 	return m.resultCh
 }
 
-// startSingleDiscoverer start a single network topology discoverer.
-func (m *manager) startSingleDiscoverer(source string) error {
-	cfg, err := m.configLoader.LoadConfig()
+func (m *manager) startDiscoverer(discoveryCfg api.DiscoveryConfig) (*discovererInstance, error) {
+	discoverer, err := api.NewDiscoverer(discoveryCfg, m.kubeClient, m.vcClient)
 	if err != nil {
-		return fmt.Errorf("failed to load config: %v", err)
-	}
-	discoveryCfg := cfg.GetDiscoveryConfig(source)
-	if discoveryCfg == nil {
-		return fmt.Errorf("configuration not found for network topology discovery source: %s", source)
-	}
-
-	discoverer, err := api.NewDiscoverer(*discoveryCfg, m.kubeClient, m.vcClient)
-	if err != nil {
-		return fmt.Errorf("failed to create discoverer: %v", err)
+		return nil, fmt.Errorf("failed to create discoverer: %v", err)
 	}
 
 	outputCh, err := discoverer.Start()
 	if err != nil {
 		if stopErr := discoverer.Stop(); stopErr != nil {
-			klog.ErrorS(stopErr, "Failed to clean up discoverer after start failure", "source", source)
+			klog.ErrorS(stopErr, "Failed to clean up discoverer after start failure", "source", discoveryCfg.Source)
 		}
-		return fmt.Errorf("failed to start discoverer: %v", err)
+		return nil, fmt.Errorf("failed to start discoverer: %v", err)
 	}
-	m.discoverers[source] = discoverer
 
-	go m.processTopology(source, outputCh)
-
-	klog.InfoS("Started network topology discoverer", "source", source)
-	return nil
+	return &discovererInstance{
+		source:          discoveryCfg.Source,
+		generation:      m.generation.Add(1),
+		discoverer:      discoverer,
+		outputCh:        outputCh,
+		processorStopCh: make(chan struct{}),
+	}, nil
 }
 
-func (m *manager) stopAllDiscoverers() {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+func (m *manager) stopInstances(instances map[string]*discovererInstance) {
+	sources := make([]string, 0, len(instances))
+	for source := range instances {
+		sources = append(sources, source)
+	}
+	sort.Strings(sources)
 
-	for source := range m.discoverers {
-		if err := m.stopSingleDiscoverer(source); err != nil {
-			klog.ErrorS(err, "Failed to stop discoverer", "source", source)
+	for _, source := range sources {
+		instance := instances[source]
+		instance.stopProcessor()
+		if err := instance.discoverer.Stop(); err != nil {
+			klog.ErrorS(err, "Failed to stop discoverer", "source", source, "generation", instance.generation)
 		}
 	}
-	m.discoverers = make(map[string]api.Discoverer)
-}
-
-func (m *manager) stopSingleDiscoverer(source string) error {
-	discoverer, exists := m.discoverers[source]
-	if !exists {
-		klog.InfoS("No need to stop discoverer as it may not start yet", "source", source)
-		return nil
-	}
-
-	if err := discoverer.Stop(); err != nil {
-		return err
-	}
-
-	delete(m.discoverers, source)
-	return nil
 }
 
 func (m *manager) worker() {
@@ -232,71 +258,100 @@ func (m *manager) syncHandler(key string) error {
 		return err
 	}
 
+	return m.replaceDiscoverers(newConfig)
+}
+
+func (m *manager) replaceDiscoverers(newConfig *api.NetworkTopologyConfig) error {
+	sources := newConfig.GetEnabledDiscoverySources()
+	sort.Strings(sources)
+
+	newInstances := make(map[string]*discovererInstance, len(sources))
+	for _, source := range sources {
+		if _, exists := newInstances[source]; exists {
+			m.stopInstances(newInstances)
+			return fmt.Errorf("duplicate enabled discovery source: %s", source)
+		}
+		discoveryCfg := newConfig.GetDiscoveryConfig(source)
+		if discoveryCfg == nil {
+			m.stopInstances(newInstances)
+			return fmt.Errorf("configuration not found for network topology discovery source: %s", source)
+		}
+
+		instance, err := m.startDiscoverer(*discoveryCfg)
+		if err != nil {
+			m.stopInstances(newInstances)
+			return err
+		}
+		newInstances[source] = instance
+	}
+
+	select {
+	case <-m.stopCh:
+		m.stopInstances(newInstances)
+		return nil
+	default:
+	}
+
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	err = m.handleRemovedSources(newConfig)
-	if err != nil {
-		return err
-	}
-
-	// TODO: Only restart changed discoverers.
-	for _, source := range newConfig.GetEnabledDiscoverySources() {
-		klog.InfoS("Restarting network discovery", "source", source)
-		if err = m.stopSingleDiscoverer(source); err != nil {
-			return err
-		}
-		if err = m.startSingleDiscoverer(source); err != nil {
-			return err
-		}
-	}
-
-	// update the config for next compare.
+	oldInstances := m.discoverers
+	m.discoverers = newInstances
 	m.config = newConfig
+	m.mutex.Unlock()
+
+	for _, source := range sources {
+		instance := newInstances[source]
+		m.processorWG.Add(1)
+		go func() {
+			defer m.processorWG.Done()
+			m.processTopology(instance)
+		}()
+		klog.InfoS("Started network topology discoverer", "source", source, "generation", instance.generation)
+	}
+	m.stopInstances(oldInstances)
 	return nil
 }
 
-// handleRemovedSources stops discoverers sources that are no longer enabled
-func (m *manager) handleRemovedSources(config *api.NetworkTopologyConfig) error {
-	oldConfig := m.config
-
-	oldSources := sets.Set[string]{}
-	for _, source := range oldConfig.GetEnabledDiscoverySources() {
-		oldSources.Insert(source)
-	}
-
-	newSources := sets.Set[string]{}
-	for _, source := range config.GetEnabledDiscoverySources() {
-		newSources.Insert(source)
-	}
-
-	for source := range oldSources.Difference(newSources) {
-		klog.InfoS("Stopping network discovery", "source", source)
-		if err := m.stopSingleDiscoverer(source); err != nil {
-			return err
-		}
-	}
-	return nil
+func (m *manager) instanceIsCurrent(instance *discovererInstance) bool {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.discoverers[instance.source] == instance
 }
 
-// processTopology processes the topology data received from the discoverer
-func (m *manager) processTopology(source string, topologyCh <-chan []*topologyv1alpha1.HyperNode) {
+// processTopology processes the topology data received from one discoverer instance.
+func (m *manager) processTopology(instance *discovererInstance) {
 	for {
 		select {
-		case hyperNodes, ok := <-topologyCh:
+		case hyperNodes, ok := <-instance.outputCh:
 			if !ok {
-				klog.InfoS("Topology channel closed, stopping processor", "source", source)
+				klog.InfoS("Topology channel closed, stopping processor", "source", instance.source, "generation", instance.generation)
 				return
 			}
 
-			m.resultCh <- Result{
+			result := Result{
 				HyperNodes: hyperNodes,
-				Source:     source,
+				Source:     instance.source,
+				Generation: instance.generation,
+				Acknowledge: sync.OnceFunc(func() {
+					instance.discoverer.ResultSynced()
+				}),
+				Current: func() bool {
+					return m.instanceIsCurrent(instance)
+				},
 			}
-			klog.V(3).InfoS("Forwarded discovery results to unified channel",
-				"source", source,
-				"nodeCount", len(hyperNodes))
+			select {
+			case m.resultCh <- result:
+				klog.V(3).InfoS("Forwarded discovery results to unified channel",
+					"source", instance.source,
+					"generation", instance.generation,
+					"nodeCount", len(hyperNodes))
+			case <-instance.processorStopCh:
+				return
+			case <-m.stopCh:
+				return
+			}
 
+		case <-instance.processorStopCh:
+			return
 		case <-m.stopCh:
 			return
 		}

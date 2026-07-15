@@ -30,6 +30,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
@@ -911,6 +913,20 @@ func TestParseCfgRejectsUnsafeConfiguration(t *testing.T) {
 			},
 			errorContains: "node leaf level must not set tierName",
 		},
+		{
+			name: "invalid qualified node label",
+			config: map[string]interface{}{
+				"networkTopologyTypes": map[string]interface{}{
+					"topologyA3": map[string]interface{}{
+						"levels": []interface{}{
+							map[string]interface{}{"nodeLabel": "bad/key/extra", "tierName": "volcano.sh/hypernode"},
+							map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+						},
+					},
+				},
+			},
+			errorContains: "not a valid qualified name",
+		},
 	}
 
 	for _, tc := range tests {
@@ -919,6 +935,68 @@ func TestParseCfgRejectsUnsafeConfiguration(t *testing.T) {
 			require.ErrorContains(t, err, tc.errorContains)
 		})
 	}
+}
+
+func TestNodeFromInformerEventHandlesTombstones(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-1",
+		Labels: map[string]string{
+			"example.com/domain": "domain-1",
+		},
+	}}
+	discoverer := &labelDiscoverer{
+		watchedNodeLabelKeys: map[string]struct{}{"example.com/domain": {}},
+		queue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[string]()),
+	}
+	t.Cleanup(discoverer.queue.ShutDown)
+
+	assert.Equal(t, map[string]string{"example.com/domain": "domain-1"},
+		discoverer.getNodeNetworkTopologyLabels(node))
+	assert.Equal(t, map[string]string{"example.com/domain": "domain-1"},
+		discoverer.getNodeNetworkTopologyLabels(cache.DeletedFinalStateUnknown{Key: node.Name, Obj: node}))
+	discoverer.DeleteNode(cache.DeletedFinalStateUnknown{Key: node.Name, Obj: node})
+	require.Eventually(t, func() bool { return discoverer.queue.Len() == 1 }, time.Second, 10*time.Millisecond,
+		"a tombstone Node deletion must enqueue topology discovery")
+
+	_, err := nodeFromInformerEvent(cache.DeletedFinalStateUnknown{Key: "bad", Obj: &corev1.Pod{}})
+	require.ErrorContains(t, err, "expected *v1.Node")
+}
+
+func TestLabelDiscovererStopIsIdempotentAndUnblocksOutput(t *testing.T) {
+	discoverer := NewLabelDiscoverer(getCfg(), fake.NewSimpleClientset(), vcclientset.NewSimpleClientset()).(*labelDiscoverer)
+	outputCh, err := discoverer.Start()
+	require.NoError(t, err)
+
+	stopped := make(chan error, 1)
+	go func() {
+		stopped <- discoverer.Stop()
+	}()
+	select {
+	case err := <-stopped:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Stop blocked while discovery output had no receiver")
+	}
+	require.NoError(t, discoverer.Stop())
+	_, open := <-outputCh
+	assert.False(t, open)
+}
+
+func TestBuildHyperNodesUsesStableTopologyOrder(t *testing.T) {
+	discoverer := &labelDiscoverer{}
+	hyperNodes := discoverer.buildHyperNodes(map[string]HyperNodeInfo{
+		"tier-2-b": {tier: 2, tierName: "tier-2"},
+		"tier-1-b": {tier: 1, tierName: "tier-1"},
+		"tier-2-a": {tier: 2, tierName: "tier-2"},
+		"tier-1-a": {tier: 1, tierName: "tier-1"},
+	})
+
+	names := make([]string, 0, len(hyperNodes))
+	for _, hyperNode := range hyperNodes {
+		names = append(names, hyperNode.Name)
+	}
+	assert.Equal(t, []string{"tier-1-a", "tier-1-b", "tier-2-a", "tier-2-b"}, names)
 }
 
 func TestParseCfgAcceptsLabelSelectorExpressions(t *testing.T) {
