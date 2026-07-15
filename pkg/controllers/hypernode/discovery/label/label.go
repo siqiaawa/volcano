@@ -203,8 +203,11 @@ func parseCfg(cfg api.DiscoveryConfig) ([]topologyProfile, map[string]struct{}, 
 	klog.InfoS("Start parse label based hyperNode auto discovery config")
 
 	var config NetworkTopologyType
-	if err := mapstructure.WeakDecode(cfg.Config, &config); err != nil {
+	if err := strictWeakDecode(cfg.Config, &config); err != nil {
 		return nil, nil, fmt.Errorf("decode networkTopologyTypes: %w", err)
+	}
+	if len(config.NetworkTopologyTypes) == 0 {
+		return nil, nil, errors.New("networkTopologyTypes must contain at least one topology profile")
 	}
 
 	names := make([]string, 0, len(config.NetworkTopologyTypes))
@@ -225,10 +228,10 @@ func parseCfg(cfg api.DiscoveryConfig) ([]topologyProfile, map[string]struct{}, 
 		profileConfig := NetworkTopologyProfile{}
 		legacyConfig := reflect.ValueOf(rawProfile).IsValid() && reflect.ValueOf(rawProfile).Kind() == reflect.Slice
 		if legacyConfig {
-			if err := mapstructure.WeakDecode(rawProfile, &profileConfig.Levels); err != nil {
+			if err := strictWeakDecode(rawProfile, &profileConfig.Levels); err != nil {
 				return nil, nil, fmt.Errorf("decode legacy topology profile %q: %w", name, err)
 			}
-		} else if err := mapstructure.WeakDecode(rawProfile, &profileConfig); err != nil {
+		} else if err := strictWeakDecode(rawProfile, &profileConfig); err != nil {
 			return nil, nil, fmt.Errorf("decode topology profile %q: %w", name, err)
 		}
 
@@ -237,6 +240,13 @@ func parseCfg(cfg api.DiscoveryConfig) ([]topologyProfile, map[string]struct{}, 
 		}
 		if len(profileConfig.Levels) < 2 {
 			return nil, nil, fmt.Errorf("invalid topology profile %q: at least one topology level and one node level are required", name)
+		}
+		leafLevel := profileConfig.Levels[len(profileConfig.Levels)-1]
+		if leafLevel.NodeLabel != v1.LabelHostname {
+			return nil, nil, fmt.Errorf("invalid topology profile %q: last level must use nodeLabel %q", name, v1.LabelHostname)
+		}
+		if leafLevel.TierName != "" {
+			return nil, nil, fmt.Errorf("invalid topology profile %q: node leaf level must not set tierName", name)
 		}
 
 		selector := labels.Everything()
@@ -292,6 +302,19 @@ func parseCfg(cfg api.DiscoveryConfig) ([]topologyProfile, map[string]struct{}, 
 	klog.InfoS("Successfully parsed label based hyperNode auto discovery config", "profileCount", len(profiles))
 
 	return profiles, watchedNodeLabelKeys, nil
+}
+
+func strictWeakDecode(input, output interface{}) error {
+	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		ErrorUnused:      true,
+		WeaklyTypedInput: true,
+		ZeroFields:       true,
+		Result:           output,
+	})
+	if err != nil {
+		return err
+	}
+	return decoder.Decode(input)
 }
 
 func checkLabels(labels []NodeLabel) error {

@@ -27,6 +27,7 @@ import (
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
@@ -605,6 +606,149 @@ func TestGenerateHyperNodesWithMixedTopologyProfiles(t *testing.T) {
 	assert.Equal(t, []string{a5HyperNode.Name}, exactMemberNames(byProfileTier["topologya5"][3]))
 }
 
+func TestGenerateHyperNodesWithMultipleDomains(t *testing.T) {
+	const (
+		profileKey      = "example.com/topology-profile"
+		hyperNodeKey    = "example.com/hypernode-domain"
+		hyperClusterKey = "example.com/hypercluster-domain"
+	)
+	cfg := api.DiscoveryConfig{Source: "label", Config: map[string]interface{}{
+		"networkTopologyTypes": map[string]interface{}{
+			"topologyA3": map[string]interface{}{
+				"nodeSelector": map[string]interface{}{
+					"matchLabels": map[string]interface{}{profileKey: "a3"},
+				},
+				"levels": []interface{}{
+					map[string]interface{}{"nodeLabel": hyperClusterKey, "tierName": "volcano.sh/hypercluster"},
+					map[string]interface{}{"nodeLabel": hyperNodeKey, "tierName": "volcano.sh/hypernode"},
+					map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+				},
+			},
+		},
+	}}
+	node := func(name, hyperNodeDomain, hyperClusterDomain string) *corev1.Node {
+		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{
+			profileKey: "a3", hyperNodeKey: hyperNodeDomain, hyperClusterKey: hyperClusterDomain,
+		}}}
+	}
+	discoverer := newDiscovererForGenerationTest(t, cfg, []*corev1.Node{
+		node("node-a1", "hn-a", "hc-a"),
+		node("node-a2", "hn-a", "hc-a"),
+		node("node-b1", "hn-b", "hc-a"),
+		node("node-c1", "hn-c", "hc-b"),
+	})
+
+	infoMap, err := discoverer.generateHyperNodeInfo()
+	require.NoError(t, err)
+	require.Len(t, infoMap, 5)
+
+	hyperNodesByDomain := make(map[string]*topologyv1alpha1.HyperNode)
+	hyperClustersByDomain := make(map[string]*topologyv1alpha1.HyperNode)
+	for _, hyperNode := range discoverer.buildHyperNodes(infoMap) {
+		switch hyperNode.Spec.Tier {
+		case 1:
+			hyperNodesByDomain[hyperNode.Labels[hyperNodeKey]] = hyperNode
+		case 2:
+			hyperClustersByDomain[hyperNode.Labels[hyperClusterKey]] = hyperNode
+		default:
+			t.Fatalf("unexpected tier %d", hyperNode.Spec.Tier)
+		}
+	}
+
+	require.Len(t, hyperNodesByDomain, 3)
+	require.Len(t, hyperClustersByDomain, 2)
+	assert.Equal(t, []string{"node-a1", "node-a2"}, exactMemberNames(hyperNodesByDomain["hn-a"]))
+	assert.Equal(t, []string{"node-b1"}, exactMemberNames(hyperNodesByDomain["hn-b"]))
+	assert.Equal(t, []string{"node-c1"}, exactMemberNames(hyperNodesByDomain["hn-c"]))
+	assert.ElementsMatch(t, []string{hyperNodesByDomain["hn-a"].Name, hyperNodesByDomain["hn-b"].Name}, exactMemberNames(hyperClustersByDomain["hc-a"]))
+	assert.Equal(t, []string{hyperNodesByDomain["hn-c"].Name}, exactMemberNames(hyperClustersByDomain["hc-b"]))
+}
+
+func TestBuildHyperNodeNameRejectsDeterministicNameConflict(t *testing.T) {
+	const domainKey = "example.com/hypernode-domain"
+	cfg := api.DiscoveryConfig{Source: "label", Config: map[string]interface{}{
+		"networkTopologyTypes": map[string]interface{}{
+			"topologyA3": map[string]interface{}{
+				"levels": []interface{}{
+					map[string]interface{}{"nodeLabel": domainKey, "tierName": "volcano.sh/hypernode"},
+					map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+				},
+			},
+		},
+	}}
+	discoverer := newDiscovererForGenerationTest(t, cfg, nil)
+	profile := discoverer.topologyProfiles[0]
+
+	deterministicName, err := discoverer.buildHyperNodeName(profile, domainKey, "hn-0", 1, nil)
+	require.NoError(t, err)
+	require.NoError(t, discoverer.hyperNodeInformer.Informer().GetIndexer().Add(&topologyv1alpha1.HyperNode{
+		ObjectMeta: metav1.ObjectMeta{Name: deterministicName, Labels: map[string]string{
+			api.NetworkTopologySourceLabelKey:  "label",
+			api.NetworkTopologyProfileLabelKey: "different-profile",
+			domainKey:                          "different-domain",
+		}},
+	}))
+
+	_, err = discoverer.buildHyperNodeName(profile, domainKey, "hn-0", 1, nil)
+	require.ErrorContains(t, err, "is already used by a different topology domain")
+}
+
+func TestNodeLabelChangesTriggerDiscovery(t *testing.T) {
+	const (
+		profileKey = "example.com/topology-profile"
+		domainKey  = "example.com/hypernode-domain"
+	)
+	cfg := api.DiscoveryConfig{Source: "label", Config: map[string]interface{}{
+		"networkTopologyTypes": map[string]interface{}{
+			"topologyA3": map[string]interface{}{
+				"nodeSelector": map[string]interface{}{
+					"matchExpressions": []interface{}{
+						map[string]interface{}{"key": profileKey, "operator": "In", "values": []interface{}{"a3"}},
+					},
+				},
+				"levels": []interface{}{
+					map[string]interface{}{"nodeLabel": domainKey, "tierName": "volcano.sh/hypernode"},
+					map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+				},
+			},
+		},
+	}}
+	discoverer, ok := NewLabelDiscoverer(cfg, fake.NewSimpleClientset(), vcclientset.NewSimpleClientset()).(*labelDiscoverer)
+	require.True(t, ok)
+	require.NoError(t, discoverer.configErr)
+	t.Cleanup(func() {
+		discoverer.queue.ShutDown()
+	})
+
+	oldNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{
+		profileKey: "a3",
+		domainKey:  "hn-0",
+	}}}
+	unrelatedUpdate := oldNode.DeepCopy()
+	unrelatedUpdate.Labels["example.com/unrelated"] = "changed"
+	discoverer.UpdateNode(oldNode, unrelatedUpdate)
+	time.Sleep(20 * time.Millisecond)
+	assert.Zero(t, discoverer.queue.Len(), "unwatched labels must not trigger a full discovery")
+
+	selectorUpdate := oldNode.DeepCopy()
+	selectorUpdate.Labels[profileKey] = "a5"
+	discoverer.UpdateNode(oldNode, selectorUpdate)
+	require.Eventually(t, func() bool {
+		return discoverer.queue.Len() == 1
+	}, time.Second, 10*time.Millisecond)
+	key, shutdown := discoverer.queue.Get()
+	require.False(t, shutdown)
+	discoverer.queue.Done(key)
+	discoverer.queue.Forget(key)
+
+	domainUpdate := oldNode.DeepCopy()
+	domainUpdate.Labels[domainKey] = "hn-1"
+	discoverer.UpdateNode(oldNode, domainUpdate)
+	require.Eventually(t, func() bool {
+		return discoverer.queue.Len() == 1
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestGenerateHyperNodesRejectsMultipleProfileMatches(t *testing.T) {
 	profile := func(levelLabel string) map[string]interface{} {
 		return map[string]interface{}{
@@ -682,6 +826,142 @@ func TestParseCfgRejectsDuplicateSemanticTierName(t *testing.T) {
 
 	_, _, err := parseCfg(cfg)
 	require.ErrorContains(t, err, "duplicate tierName")
+}
+
+func TestParseCfgRejectsUnsafeConfiguration(t *testing.T) {
+	validProfile := func() map[string]interface{} {
+		return map[string]interface{}{
+			"levels": []interface{}{
+				map[string]interface{}{"nodeLabel": "example.com/hypernode", "tierName": "volcano.sh/hypernode"},
+				map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+			},
+		}
+	}
+
+	tests := []struct {
+		name          string
+		config        map[string]interface{}
+		errorContains string
+	}{
+		{
+			name: "missing network topology types",
+			config: map[string]interface{}{
+				"networkTopologyType": map[string]interface{}{"topologyA3": validProfile()},
+			},
+			errorContains: "networkTopologyType",
+		},
+		{
+			name: "empty network topology types",
+			config: map[string]interface{}{
+				"networkTopologyTypes": map[string]interface{}{},
+			},
+			errorContains: "at least one topology profile",
+		},
+		{
+			name: "unknown profile field",
+			config: map[string]interface{}{
+				"networkTopologyTypes": map[string]interface{}{
+					"topologyA3": map[string]interface{}{
+						"nodeSelecter": map[string]interface{}{},
+						"levels":       validProfile()["levels"],
+					},
+				},
+			},
+			errorContains: "nodeSelecter",
+		},
+		{
+			name: "unknown level field",
+			config: map[string]interface{}{
+				"networkTopologyTypes": map[string]interface{}{
+					"topologyA3": map[string]interface{}{
+						"levels": []interface{}{
+							map[string]interface{}{"nodeLabel": "example.com/hypernode", "tierNmae": "volcano.sh/hypernode"},
+							map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+						},
+					},
+				},
+			},
+			errorContains: "tierNmae",
+		},
+		{
+			name: "leaf level is not hostname",
+			config: map[string]interface{}{
+				"networkTopologyTypes": map[string]interface{}{
+					"topologyA3": map[string]interface{}{
+						"levels": []interface{}{
+							map[string]interface{}{"nodeLabel": "example.com/hypernode", "tierName": "volcano.sh/hypernode"},
+							map[string]interface{}{"nodeLabel": "example.com/node-id"},
+						},
+					},
+				},
+			},
+			errorContains: "last level must use nodeLabel",
+		},
+		{
+			name: "leaf level has tier name",
+			config: map[string]interface{}{
+				"networkTopologyTypes": map[string]interface{}{
+					"topologyA3": map[string]interface{}{
+						"levels": []interface{}{
+							map[string]interface{}{"nodeLabel": "example.com/hypernode", "tierName": "volcano.sh/hypernode"},
+							map[string]interface{}{"nodeLabel": corev1.LabelHostname, "tierName": "volcano.sh/node"},
+						},
+					},
+				},
+			},
+			errorContains: "node leaf level must not set tierName",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := parseCfg(api.DiscoveryConfig{Source: "label", Config: tc.config})
+			require.ErrorContains(t, err, tc.errorContains)
+		})
+	}
+}
+
+func TestParseCfgAcceptsLabelSelectorExpressions(t *testing.T) {
+	cfg := api.DiscoveryConfig{Source: "label", Config: map[string]interface{}{
+		"networkTopologyTypes": map[string]interface{}{
+			"topologyA5": map[string]interface{}{
+				"nodeSelector": map[string]interface{}{
+					"matchExpressions": []interface{}{
+						map[string]interface{}{"key": "example.com/region", "operator": "In", "values": []interface{}{"east", "west"}},
+						map[string]interface{}{"key": "example.com/environment", "operator": "NotIn", "values": []interface{}{"development"}},
+						map[string]interface{}{"key": "example.com/accelerator", "operator": "Exists"},
+						map[string]interface{}{"key": "example.com/retired", "operator": "DoesNotExist"},
+					},
+				},
+				"levels": []interface{}{
+					map[string]interface{}{"nodeLabel": "example.com/hypernode", "tierName": "volcano.sh/hypernode"},
+					map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+				},
+			},
+		},
+	}}
+
+	profiles, watchedKeys, err := parseCfg(cfg)
+	require.NoError(t, err)
+	require.Len(t, profiles, 1)
+	assert.True(t, profiles[0].nodeSelector.Matches(labels.Set{
+		"example.com/region":      "east",
+		"example.com/environment": "production",
+		"example.com/accelerator": "gpu",
+	}))
+	assert.False(t, profiles[0].nodeSelector.Matches(labels.Set{
+		"example.com/region":      "east",
+		"example.com/environment": "development",
+		"example.com/accelerator": "gpu",
+	}))
+	for _, key := range []string{
+		"example.com/region",
+		"example.com/environment",
+		"example.com/accelerator",
+		"example.com/retired",
+	} {
+		assert.Contains(t, watchedKeys, key)
+	}
 }
 
 func TestParseMixedTopologyProfilesFromYAML(t *testing.T) {

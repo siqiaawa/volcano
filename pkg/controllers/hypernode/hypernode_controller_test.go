@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
@@ -218,6 +220,148 @@ func TestHyperNodeController_Run(t *testing.T) {
 	close(stopCh)
 	time.Sleep(100 * time.Millisecond)
 	assert.True(t, func() bool { mockManager.mu.Lock(); defer mockManager.mu.Unlock(); return mockManager.stopCalled }(), "Discovery manager should be stopped")
+}
+
+func TestInvalidLabelDiscoveryConfigPreservesLastValidTopology(t *testing.T) {
+	const (
+		configKey   = "test-namespace/test-config"
+		profileKey  = "example.com/topology-profile"
+		domainKey   = "example.com/hypernode-domain"
+		domainValue = "hn-0"
+	)
+
+	validConfig := func() *api.NetworkTopologyConfig {
+		return &api.NetworkTopologyConfig{NetworkTopologyDiscovery: []api.DiscoveryConfig{
+			{
+				Source:  "label",
+				Enabled: true,
+				Config: map[string]interface{}{
+					"networkTopologyTypes": map[string]interface{}{
+						"topologyA3": map[string]interface{}{
+							"nodeSelector": map[string]interface{}{
+								"matchLabels": map[string]interface{}{profileKey: "a3"},
+							},
+							"levels": []interface{}{
+								map[string]interface{}{"nodeLabel": domainKey, "tierName": "volcano.sh/hypernode"},
+								map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+							},
+						},
+					},
+				},
+			},
+		}}
+	}
+	invalidConfig := &api.NetworkTopologyConfig{NetworkTopologyDiscovery: []api.DiscoveryConfig{
+		{
+			Source:  "label",
+			Enabled: true,
+			Config: map[string]interface{}{
+				"networkTopologyTypes": map[string]interface{}{
+					"topologyA3": map[string]interface{}{
+						"levels": []interface{}{
+							map[string]interface{}{"nodeLabel": domainKey, "tierNmae": "volcano.sh/hypernode"},
+							map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+						},
+					},
+				},
+			},
+		},
+	}}
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "a3-node",
+		Labels: map[string]string{
+			profileKey:           "a3",
+			domainKey:            domainValue,
+			corev1.LabelHostname: "a3-node",
+		},
+	}}
+	kubeClient := k8sfake.NewSimpleClientset(node)
+	vcClient := vcclientset.NewSimpleClientset()
+	vcInformerFactory := vcinformer.NewSharedInformerFactory(vcClient, 0)
+	stopInformers := make(chan struct{})
+	defer close(stopInformers)
+	vcInformerFactory.Start(stopInformers)
+	for informerType, synced := range vcInformerFactory.WaitForCacheSync(stopInformers) {
+		require.True(t, synced, "failed to sync informer %v", informerType)
+	}
+
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	loader := config.NewFakeLoader(validConfig())
+	manager := discovery.NewManager(loader, queue, kubeClient, vcClient)
+	require.NoError(t, manager.Start())
+	defer func() {
+		manager.Stop()
+		queue.ShutDown()
+	}()
+
+	controller := &hyperNodeController{
+		vcClient:          vcClient,
+		hyperNodeInformer: vcInformerFactory.Topology().V1alpha1().HyperNodes(),
+		hyperNodeLister:   vcInformerFactory.Topology().V1alpha1().HyperNodes().Lister(),
+	}
+	reconcileNextResult := func() string {
+		t.Helper()
+		select {
+		case result := <-manager.ResultChannel():
+			require.Equal(t, "label", result.Source)
+			require.Len(t, result.HyperNodes, 1)
+			controller.reconcileTopology(result.Source, result.HyperNodes)
+			manager.ResultSynced(result.Source)
+			return result.HyperNodes[0].Name
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for label discovery result")
+			return ""
+		}
+	}
+	listHyperNodes := func() []topologyv1alpha1.HyperNode {
+		t.Helper()
+		list, err := vcClient.TopologyV1alpha1().HyperNodes().List(context.Background(), metav1.ListOptions{})
+		require.NoError(t, err)
+		return list.Items
+	}
+	deleteActionCount := func() int {
+		count := 0
+		for _, action := range vcClient.Actions() {
+			if action.GetVerb() == "delete" && action.GetResource().Resource == "hypernodes" {
+				count++
+			}
+		}
+		return count
+	}
+
+	queue.Add(configKey)
+	expectedName := reconcileNextResult()
+	require.Eventually(t, func() bool {
+		hyperNodes := listHyperNodes()
+		return len(hyperNodes) == 1 && hyperNodes[0].Name == expectedName
+	}, 5*time.Second, 10*time.Millisecond)
+	deleteCountBeforeInvalidConfig := deleteActionCount()
+
+	loader.SetConfig(invalidConfig)
+	queue.Add(configKey)
+	require.Eventually(t, func() bool {
+		return queue.NumRequeues(configKey) > 0
+	}, 5*time.Second, 10*time.Millisecond, "invalid config should fail and be retried")
+	select {
+	case result := <-manager.ResultChannel():
+		t.Fatalf("invalid config unexpectedly published %d HyperNodes", len(result.HyperNodes))
+	case <-time.After(200 * time.Millisecond):
+	}
+	hyperNodesDuringError := listHyperNodes()
+	require.Len(t, hyperNodesDuringError, 1)
+	assert.Equal(t, expectedName, hyperNodesDuringError[0].Name)
+	assert.Equal(t, deleteCountBeforeInvalidConfig, deleteActionCount(), "invalid config must not delete the last valid topology")
+
+	loader.SetConfig(validConfig())
+	queue.Add(configKey)
+	recoveredName := reconcileNextResult()
+	assert.Equal(t, expectedName, recoveredName)
+	require.Eventually(t, func() bool {
+		hyperNodes := listHyperNodes()
+		return len(hyperNodes) == 1 && hyperNodes[0].Name == expectedName
+	}, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, deleteCountBeforeInvalidConfig, deleteActionCount())
 }
 
 func TestHyperNodeController_Initialize(t *testing.T) {
