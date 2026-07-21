@@ -6,11 +6,12 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly DEFAULT_NODE_IMAGE="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
 
 run_kind=1
 keep_cluster=0
+create_archive=1
 cluster_name=""
 node_image="${DEFAULT_NODE_IMAGE}"
 output_base="${HOME}/volcano-kind-diagnostics"
@@ -22,6 +23,7 @@ Usage: kind-host-diagnose.sh [options]
 Options:
   --skip-kind              Collect host diagnostics without creating a cluster.
   --keep-cluster           Keep the debug cluster even when creation succeeds.
+  --no-archive             Keep the report directory without creating a tarball.
   --cluster-name NAME      Use NAME instead of an automatically generated name.
   --node-image IMAGE       Override the Kind node image used by the smoke test.
   --output-dir DIR         Store reports under DIR.
@@ -46,6 +48,10 @@ while (($# > 0)); do
       ;;
     --keep-cluster)
       keep_cluster=1
+      shift
+      ;;
+    --no-archive)
+      create_archive=0
       shift
       ;;
     --cluster-name)
@@ -331,6 +337,7 @@ section "Automated diagnosis"
 logging_driver=""
 virtualization=""
 node_oom=""
+permission_signal=0
 if ((docker_ready == 1)); then
   logging_driver="$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)"
 fi
@@ -338,32 +345,59 @@ virtualization="$(systemd-detect-virt 2>/dev/null || true)"
 if [[ -f "${report_dir}/kind-node-state.txt" ]]; then
   node_oom="$(grep -Eo 'OOMKilled=(true|false)' "${report_dir}/kind-node-state.txt" | head -n 1 || true)"
 fi
+if grep -qiE 'operation not permitted|permission denied|failed to mount|read-only file system|cgroup.*(fail|error)' \
+    "${report_dir}/kind-node-docker.log" "${report_dir}/kind-node-journal.log" 2>/dev/null; then
+  permission_signal=1
+fi
+
+result_code="UNKNOWN_LOCAL_REVIEW"
+if [[ "${smoke_status}" == "SKIPPED" ]]; then
+  result_code="HOST_INFO_ONLY"
+elif [[ "${smoke_status}" == "PASS" ]]; then
+  result_code="KIND_OK"
+elif ((docker_ready == 0)); then
+  result_code="DOCKER_UNREACHABLE"
+elif ! command -v kind >/dev/null 2>&1 || ! command -v kubectl >/dev/null 2>&1; then
+  result_code="PREREQUISITE_MISSING"
+elif [[ "${logging_driver}" == "none" ]]; then
+  result_code="DOCKER_LOGGING_DISABLED"
+elif [[ "${node_oom}" == "OOMKilled=true" ]]; then
+  result_code="NODE_OOM"
+elif ((permission_signal == 1)); then
+  result_code="CGROUP_PERMISSION"
+elif [[ "${virtualization}" =~ ^(docker|lxc|lxc-libvirt|openvz|podman|container-other)$ ]]; then
+  result_code="NESTED_CONTAINER"
+fi
 
 {
+  printf 'RESULT_CODE=%s\n' "${result_code}"
   printf 'Smoke test: %s\n' "${smoke_status}"
   [[ -n "${smoke_exit_code}" ]] && printf 'Kind exit code: %s\n' "${smoke_exit_code}"
   printf 'Docker logging driver: %s\n' "${logging_driver:-unknown}"
   printf 'Host virtualization: %s\n' "${virtualization:-unknown}"
   printf 'Node OOM state: %s\n\n' "${node_oom:-unknown}"
 
-  if [[ "${smoke_status}" == "PASS" ]]; then
+  if [[ "${result_code}" == "HOST_INFO_ONLY" ]]; then
+    printf 'Conclusion: host information was collected without running Kind.\n'
+  elif [[ "${result_code}" == "KIND_OK" ]]; then
     printf 'Conclusion: this host can start the required Kind v1.36.1 node image.\n'
     printf 'If the five-node Volcano configuration still fails, inspect host memory, disk,\n'
     printf 'inode usage, and Docker limits in this report.\n'
-  elif ((docker_ready == 0)); then
+  elif [[ "${result_code}" == "DOCKER_UNREACHABLE" ]]; then
     printf 'Likely cause: Docker is missing, stopped, or inaccessible to the current user.\n'
-  elif [[ "${logging_driver}" == "none" ]]; then
+  elif [[ "${result_code}" == "PREREQUISITE_MISSING" ]]; then
+    printf 'Likely cause: kind or kubectl is not installed or is not available in PATH.\n'
+  elif [[ "${result_code}" == "DOCKER_LOGGING_DISABLED" ]]; then
     printf 'Likely cause: Docker logging driver is "none". Kind cannot observe the\n'
     printf 'systemd readiness line and reports "could not find a log line". Do not\n'
     printf 'overwrite daemon.json or restart Docker before reviewing existing settings.\n'
-  elif [[ "${node_oom}" == "OOMKilled=true" ]]; then
+  elif [[ "${result_code}" == "NODE_OOM" ]]; then
     printf 'Likely cause: the Kind node was killed by the host out-of-memory mechanism.\n'
-  elif grep -qiE 'operation not permitted|permission denied|failed to mount|read-only file system|cgroup.*(fail|error)' \
-      "${report_dir}/kind-node-docker.log" "${report_dir}/kind-node-journal.log" 2>/dev/null; then
+  elif [[ "${result_code}" == "CGROUP_PERMISSION" ]]; then
     printf 'Likely cause: the host cannot provide the privileged mount/cgroup behavior\n'
     printf 'required by a Kind node. Check whether this server is itself a restricted\n'
     printf 'LXC, OpenVZ, Docker, or other nested-container environment.\n'
-  elif [[ "${virtualization}" =~ ^(docker|lxc|lxc-libvirt|openvz|podman|container-other)$ ]]; then
+  elif [[ "${result_code}" == "NESTED_CONTAINER" ]]; then
     printf 'Likely cause: Kind is running inside a containerized server environment\n'
     printf 'without sufficient nested-container and cgroup delegation support.\n'
   else
@@ -382,7 +416,9 @@ fi
 cat "${diagnosis_file}" | tee -a "${summary_file}"
 
 section "Report archive"
-if command -v tar >/dev/null 2>&1; then
+if ((create_archive == 0)); then
+  say "Archive disabled by --no-archive; report remains only in: ${report_dir}"
+elif command -v tar >/dev/null 2>&1; then
   tar -czf "${archive_path}" -C "$(dirname "${report_dir}")" "$(basename "${report_dir}")"
   archive_rc=$?
   if ((archive_rc == 0)); then
@@ -395,7 +431,7 @@ else
 fi
 
 say "Finished: $(date --iso-8601=seconds 2>/dev/null || date)"
-say "Review logs for hostnames, internal addresses, and registry configuration before sharing."
+say "Confidential environments: keep the report on the authorized server and do not transfer it."
 
 if [[ "${smoke_status}" == "FAIL" ]]; then
   exit 1
