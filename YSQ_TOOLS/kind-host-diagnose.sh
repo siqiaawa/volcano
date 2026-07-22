@@ -6,8 +6,12 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 readonly DEFAULT_NODE_IMAGE="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=kind-diagnostic-lib.sh
+source "${script_dir}/kind-diagnostic-lib.sh"
 
 run_kind=1
 keep_cluster=0
@@ -374,6 +378,9 @@ docker_ready_lines="unknown"
 journal_ready_lines="unknown"
 permission_signal=0
 kind_wait_log_error=0
+kind_log_signature="NOT_AVAILABLE"
+kind_log_result_code=""
+kind_log_next_action=""
 if ((docker_ready == 1)); then
   logging_driver="$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)"
   host_cgroup_version="$(docker info --format '{{.CgroupVersion}}' 2>/dev/null || true)"
@@ -423,6 +430,18 @@ fi
 if grep -q 'could not find a log line that matches' "${report_dir}/kind-create.log" 2>/dev/null; then
   kind_wait_log_error=1
 fi
+if [[ "${docker_log_lines}" == "0" ]]; then
+  KIND_LOG_SIGNATURE="NO_LOG_OUTPUT"
+  KIND_LOG_RESULT_CODE="DOCKER_LOG_EMPTY"
+  KIND_LOG_NEXT_ACTION="CHECK_DOCKER_STDOUT_PATH"
+elif [[ -f "${report_dir}/kind-node-docker.log" ]]; then
+  classify_kind_node_log "${report_dir}/kind-node-docker.log"
+fi
+if [[ -n "${KIND_LOG_SIGNATURE:-}" ]]; then
+  kind_log_signature="${KIND_LOG_SIGNATURE}"
+  kind_log_result_code="${KIND_LOG_RESULT_CODE}"
+  kind_log_next_action="${KIND_LOG_NEXT_ACTION}"
+fi
 
 result_code="UNKNOWN_LOCAL_REVIEW"
 next_action="REVIEW_LOCAL_DIAGNOSTICS"
@@ -444,6 +463,9 @@ elif [[ "${logging_driver}" == "none" ]]; then
 elif [[ "${node_oom}" == "true" ]]; then
   result_code="NODE_OOM"
   next_action="CHECK_HOST_MEMORY"
+elif [[ -n "${kind_log_result_code}" && "${kind_log_signature}" != "UNCLASSIFIED_LOG" ]]; then
+  result_code="${kind_log_result_code}"
+  next_action="${kind_log_next_action}"
 elif [[ "${container_state}" =~ ^(exited|dead)$ ]]; then
   result_code="NODE_CONTAINER_EXITED"
   next_action="CHECK_LOCAL_NODE_DOCKER_LOG"
@@ -499,6 +521,7 @@ fi
   printf 'Container state: %s\n' "${container_state}"
   printf 'Container exit code: %s\n' "${container_exit_code}"
   printf 'Node log driver: %s\n' "${node_log_driver}"
+  printf 'Error signature: %s\n' "${kind_log_signature}"
   printf 'PID 1: %s\n' "${pid1}"
   printf 'systemd state: %s\n' "${systemd_state}"
   printf 'multi-user target: %s\n' "${multi_user_state}"
@@ -528,6 +551,18 @@ fi
     printf 'Likely cause: the Kind node was killed by the host out-of-memory mechanism.\n'
   elif [[ "${result_code}" == "NODE_CONTAINER_EXITED" ]]; then
     printf 'Likely cause: the Kind node container exited before systemd became ready.\n'
+  elif [[ "${result_code}" == "CGROUP_INITIALIZATION_FAILED" ]]; then
+    printf 'Likely cause: systemd could not initialize its cgroup hierarchy.\n'
+  elif [[ "${result_code}" == "SYSTEMD_FATAL" ]]; then
+    printf 'Likely cause: systemd encountered a fatal startup error.\n'
+  elif [[ "${result_code}" == "NODE_MOUNT_PERMISSION" ]]; then
+    printf 'Likely cause: the host denied a mount required by the Kind node.\n'
+  elif [[ "${result_code}" == "NODE_NO_SPACE" ]]; then
+    printf 'Likely cause: Docker storage or inode capacity is exhausted.\n'
+  elif [[ "${result_code}" == "NODE_MEMORY_FAILURE" ]]; then
+    printf 'Likely cause: the node could not allocate memory during startup.\n'
+  elif [[ "${result_code}" == "NODE_ARCH_MISMATCH" ]]; then
+    printf 'Likely cause: the Kind node image architecture does not match the host.\n'
   elif [[ "${result_code}" == "CGROUP_PERMISSION" ]]; then
     printf 'Likely cause: the host cannot provide the privileged mount/cgroup behavior\n'
     printf 'required by a Kind node. Check whether this server is itself a restricted\n'
@@ -572,6 +607,7 @@ fi
   printf 'CONTAINER_EXIT=%s\n' "${container_exit_code}"
   printf 'OOM_KILLED=%s\n' "${node_oom}"
   printf 'NODE_LOG_DRIVER=%s\n' "${node_log_driver}"
+  printf 'ERROR_SIGNATURE=%s\n' "${kind_log_signature}"
   printf 'PID1=%s\n' "${pid1}"
   printf 'SYSTEMD_STATE=%s\n' "${systemd_state}"
   printf 'MULTI_USER=%s\n' "${multi_user_state}"

@@ -29,6 +29,14 @@ cd /root/work/volcano-mixed-topology
 git pull --ff-only origin feature/mixed-topology-hypernode
 ```
 
+如果复制上述命令时出现 `invalid refspec`，改为逐条执行，避免隐藏字符进入分支名：
+
+```bash
+git fetch origin
+git switch feature/mixed-topology-hypernode
+git merge --ff-only origin/feature/mixed-topology-hypernode
+```
+
 确认当前提交，然后给脚本增加执行权限：
 
 ```bash
@@ -41,6 +49,7 @@ chmod +x YSQ_TOOLS/kind-host-diagnose.sh
 ```bash
 chmod +x YSQ_TOOLS/kind-host-diagnose.sh
 chmod +x YSQ_TOOLS/kind-quick-diagnose.sh
+chmod +x YSQ_TOOLS/kind-node-quick-inspect.sh
 ```
 
 运行简洁检测入口：
@@ -83,6 +92,50 @@ CLEANUP_CLUSTER=volcano-kind-debug-时间戳
 ```text
 Report directory: /root/volcano-kind-diagnostics/kind-host-diagnostics-20260721-180000
 ```
+
+## 检查已经保留的失败节点
+
+如果简洁检测已经返回 `NODE_CONTAINER_EXITED`，不要立即重新创建集群。使用结果中的
+`CLEANUP_CLUSTER` 值检查现有容器。例如：
+
+```bash
+chmod +x YSQ_TOOLS/kind-node-quick-inspect.sh
+./YSQ_TOOLS/kind-node-quick-inspect.sh \
+  volcano-kind-debug-20260722-114209
+```
+
+该命令不会创建或删除集群，也不会显示原始日志。它只输出固定签名：
+
+```text
+=== SAFE_NODE_EXIT_RESULT ===
+RESULT_CODE=CGROUP_INITIALIZATION_FAILED
+ERROR_SIGNATURE=CGROUP_INIT_SCOPE_FAILED
+CONTAINER_STATE=exited
+CONTAINER_EXIT=255
+OOM_KILLED=false
+NODE_LOG_DRIVER=json-file
+DOCKER_LOG_LINES=50
+HOST_CGROUP_VERSION=2
+NEXT_ACTION=CHECK_DOCKER_CGROUP_DELEGATION
+CLEANUP_CLUSTER=volcano-kind-debug-20260722-114209
+=== END_SAFE_NODE_EXIT_RESULT ===
+```
+
+常见安全签名：
+
+| `ERROR_SIGNATURE` | 含义 |
+|---|---|
+| `CGROUP_INIT_SCOPE_FAILED` | systemd 无法创建 `/init.scope` cgroup |
+| `CGROUP_READ_ONLY` | 容器内 cgroup 文件系统只读 |
+| `SYSTEMD_MANAGER_FAILED` | systemd manager 初始化失败 |
+| `CGROUP_INITIALIZATION_FAILED` | 其他 cgroup 初始化失败 |
+| `NODE_MOUNT_PERMISSION` | 必要 mount 被宿主机拒绝 |
+| `NODE_NO_SPACE` | Docker 磁盘或 inode 不足 |
+| `NODE_MEMORY_FAILURE` | 节点启动期间内存分配失败 |
+| `NODE_ARCH_MISMATCH` | 节点镜像架构不匹配 |
+| `SYSTEMD_FATAL` | systemd 发生其他致命启动错误 |
+| `OPERATION_NOT_PERMITTED` | 宿主机拒绝 privileged/cgroup 操作 |
+| `UNCLASSIFIED_LOG` | 已有日志，但不匹配已知安全签名 |
 
 ## 失败集群的处理
 
@@ -127,6 +180,12 @@ grep '^RESULT_CODE=' \
 | `DOCKER_LOGGING_DISABLED` | Docker 日志驱动为 `none` |
 | `NODE_OOM` | Kind 节点被 OOM 杀死 |
 | `NODE_CONTAINER_EXITED` | Kind 节点容器提前退出 |
+| `CGROUP_INITIALIZATION_FAILED` | systemd 无法初始化 cgroup 层级 |
+| `SYSTEMD_FATAL` | systemd 启动时发生致命错误 |
+| `NODE_MOUNT_PERMISSION` | 宿主机拒绝节点所需 mount |
+| `NODE_NO_SPACE` | Docker 磁盘或 inode 不足 |
+| `NODE_MEMORY_FAILURE` | 节点启动期间内存分配失败 |
+| `NODE_ARCH_MISMATCH` | 节点镜像与宿主机架构不匹配 |
 | `CGROUP_PERMISSION` | cgroup、mount 或 privileged 权限不足 |
 | `NESTED_CONTAINER` | 服务器本身是受限容器环境 |
 | `SYSTEMD_NOT_PID1` | Kind 节点 PID 1 不是 systemd |
