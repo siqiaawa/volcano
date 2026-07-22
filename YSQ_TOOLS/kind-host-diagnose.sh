@@ -6,12 +6,13 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly DEFAULT_NODE_IMAGE="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
 
 run_kind=1
 keep_cluster=0
 create_archive=1
+concise_output=0
 cluster_name=""
 node_image="${DEFAULT_NODE_IMAGE}"
 output_base="${HOME}/volcano-kind-diagnostics"
@@ -24,6 +25,8 @@ Options:
   --skip-kind              Collect host diagnostics without creating a cluster.
   --keep-cluster           Keep the debug cluster even when creation succeeds.
   --no-archive             Keep the report directory without creating a tarball.
+  --concise                Hide progress and print only a short safe result block.
+  --confidential           Equivalent to --no-archive --concise.
   --cluster-name NAME      Use NAME instead of an automatically generated name.
   --node-image IMAGE       Override the Kind node image used by the smoke test.
   --output-dir DIR         Store reports under DIR.
@@ -52,6 +55,15 @@ while (($# > 0)); do
       ;;
     --no-archive)
       create_archive=0
+      shift
+      ;;
+    --concise)
+      concise_output=1
+      shift
+      ;;
+    --confidential)
+      create_archive=0
+      concise_output=1
       shift
       ;;
     --cluster-name)
@@ -93,13 +105,19 @@ mkdir -p "${report_dir}" || die "cannot create report directory: ${report_dir}"
 
 summary_file="${report_dir}/summary.txt"
 diagnosis_file="${report_dir}/diagnosis.txt"
+safe_result_file="${report_dir}/safe-result.txt"
 smoke_status="SKIPPED"
 smoke_exit_code=""
 cluster_retained=0
 docker_ready=0
+node_container=""
 
 say() {
-  printf '%s\n' "$*" | tee -a "${summary_file}"
+  if ((concise_output == 1)); then
+    printf '%s\n' "$*" >>"${summary_file}"
+  else
+    printf '%s\n' "$*" | tee -a "${summary_file}"
+  fi
 }
 
 section() {
@@ -138,6 +156,11 @@ capture_shell() {
     return "${rc}"
   } >"${report_dir}/${filename}" 2>&1
 }
+
+if ((concise_output == 1)); then
+  printf 'KIND_DIAG=RUNNING\n'
+  printf 'WAIT_HINT=the single-node check can take up to two minutes\n'
+fi
 
 say "Volcano Kind host diagnostics"
 say "Script version: ${SCRIPT_VERSION}"
@@ -336,37 +359,134 @@ fi
 section "Automated diagnosis"
 logging_driver=""
 virtualization=""
-node_oom=""
+host_cgroup_version="unknown"
+container_cgroup_fs="unknown"
+container_state="unknown"
+container_exit_code="unknown"
+node_oom="unknown"
+node_log_driver="unknown"
+pid1="unknown"
+systemd_state="unknown"
+multi_user_state="unknown"
+failed_units="unknown"
+docker_log_lines="unknown"
+docker_ready_lines="unknown"
+journal_ready_lines="unknown"
 permission_signal=0
+kind_wait_log_error=0
 if ((docker_ready == 1)); then
   logging_driver="$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)"
+  host_cgroup_version="$(docker info --format '{{.CgroupVersion}}' 2>/dev/null || true)"
+  [[ -n "${host_cgroup_version}" ]] || host_cgroup_version="unknown"
 fi
 virtualization="$(systemd-detect-virt 2>/dev/null || true)"
-if [[ -f "${report_dir}/kind-node-state.txt" ]]; then
-  node_oom="$(grep -Eo 'OOMKilled=(true|false)' "${report_dir}/kind-node-state.txt" | head -n 1 || true)"
+if [[ -n "${node_container}" ]] && docker inspect "${node_container}" >/dev/null 2>&1; then
+  container_state="$(docker inspect "${node_container}" --format '{{.State.Status}}' 2>/dev/null || true)"
+  container_exit_code="$(docker inspect "${node_container}" --format '{{.State.ExitCode}}' 2>/dev/null || true)"
+  node_oom="$(docker inspect "${node_container}" --format '{{.State.OOMKilled}}' 2>/dev/null || true)"
+  node_log_driver="$(docker inspect "${node_container}" --format '{{.HostConfig.LogConfig.Type}}' 2>/dev/null || true)"
+  [[ -n "${container_state}" ]] || container_state="unknown"
+  [[ -n "${container_exit_code}" ]] || container_exit_code="unknown"
+  [[ -n "${node_oom}" ]] || node_oom="unknown"
+  [[ -n "${node_log_driver}" ]] || node_log_driver="unknown"
+
+  docker_log_lines="$(docker logs "${node_container}" 2>&1 | wc -l | tr -d '[:space:]')"
+  docker_ready_lines="$(docker logs "${node_container}" 2>&1 | \
+    grep -Ec 'Reached target .*Multi-User System|detected cgroup v1' || true)"
+  [[ -n "${docker_log_lines}" ]] || docker_log_lines="unknown"
+  [[ -n "${docker_ready_lines}" ]] || docker_ready_lines="unknown"
+
+  node_running="$(docker inspect "${node_container}" --format '{{.State.Running}}' 2>/dev/null || true)"
+  if [[ "${node_running}" == "true" ]]; then
+    pid1="$(docker exec "${node_container}" ps -p 1 -o comm= 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+    systemd_state="$(docker exec "${node_container}" systemctl is-system-running 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+    multi_user_state="$(docker exec "${node_container}" systemctl is-active multi-user.target 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+    failed_units="$(docker exec "${node_container}" systemctl --failed --no-legend --plain 2>/dev/null | \
+      sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
+    journal_ready_lines="$(docker exec "${node_container}" bash -c \
+      'journalctl -b -o cat --no-pager 2>/dev/null | grep -Ec "Reached target .*Multi-User System|detected cgroup v1"' \
+      2>/dev/null || true)"
+    container_cgroup_fs="$(docker exec "${node_container}" stat -fc %T /sys/fs/cgroup 2>/dev/null | \
+      head -n 1 | tr -d '[:space:]' || true)"
+    [[ -n "${pid1}" ]] || pid1="unknown"
+    [[ -n "${systemd_state}" ]] || systemd_state="unknown"
+    [[ -n "${multi_user_state}" ]] || multi_user_state="unknown"
+    [[ -n "${failed_units}" ]] || failed_units="unknown"
+    [[ -n "${journal_ready_lines}" ]] || journal_ready_lines="unknown"
+    [[ -n "${container_cgroup_fs}" ]] || container_cgroup_fs="unknown"
+  fi
 fi
 if grep -qiE 'operation not permitted|permission denied|failed to mount|read-only file system|cgroup.*(fail|error)' \
     "${report_dir}/kind-node-docker.log" "${report_dir}/kind-node-journal.log" 2>/dev/null; then
   permission_signal=1
 fi
+if grep -q 'could not find a log line that matches' "${report_dir}/kind-create.log" 2>/dev/null; then
+  kind_wait_log_error=1
+fi
 
 result_code="UNKNOWN_LOCAL_REVIEW"
+next_action="REVIEW_LOCAL_DIAGNOSTICS"
 if [[ "${smoke_status}" == "SKIPPED" ]]; then
   result_code="HOST_INFO_ONLY"
+  next_action="RUN_WITHOUT_SKIP_KIND"
 elif [[ "${smoke_status}" == "PASS" ]]; then
   result_code="KIND_OK"
+  next_action="RUN_FULL_HYPERNODE_E2E"
 elif ((docker_ready == 0)); then
   result_code="DOCKER_UNREACHABLE"
+  next_action="CHECK_DOCKER_DAEMON"
 elif ! command -v kind >/dev/null 2>&1 || ! command -v kubectl >/dev/null 2>&1; then
   result_code="PREREQUISITE_MISSING"
+  next_action="CHECK_KIND_AND_KUBECTL"
 elif [[ "${logging_driver}" == "none" ]]; then
   result_code="DOCKER_LOGGING_DISABLED"
-elif [[ "${node_oom}" == "OOMKilled=true" ]]; then
+  next_action="REVIEW_DOCKER_LOGGING_CONFIG"
+elif [[ "${node_oom}" == "true" ]]; then
   result_code="NODE_OOM"
+  next_action="CHECK_HOST_MEMORY"
+elif [[ "${container_state}" =~ ^(exited|dead)$ ]]; then
+  result_code="NODE_CONTAINER_EXITED"
+  next_action="CHECK_LOCAL_NODE_DOCKER_LOG"
 elif ((permission_signal == 1)); then
   result_code="CGROUP_PERMISSION"
+  next_action="CHECK_HOST_CGROUP_AND_NESTING"
 elif [[ "${virtualization}" =~ ^(docker|lxc|lxc-libvirt|openvz|podman|container-other)$ ]]; then
   result_code="NESTED_CONTAINER"
+  next_action="USE_VM_OR_ENABLE_NESTING"
+elif [[ "${container_state}" == "running" && "${pid1}" != "systemd" ]]; then
+  result_code="SYSTEMD_NOT_PID1"
+  next_action="CHECK_NODE_IMAGE_ENTRYPOINT"
+elif [[ "${systemd_state}" =~ ^(starting|initializing)$ ]]; then
+  result_code="SYSTEMD_NOT_READY"
+  next_action="CHECK_LOCAL_FAILED_UNITS_AND_JOURNAL"
+elif [[ "${systemd_state}" =~ ^(maintenance|emergency|offline|failed)$ ]]; then
+  result_code="SYSTEMD_FAILED"
+  next_action="CHECK_LOCAL_SYSTEMD_JOURNAL"
+elif [[ "${multi_user_state}" =~ ^(inactive|failed|deactivating)$ ]]; then
+  result_code="MULTI_USER_INACTIVE"
+  next_action="CHECK_LOCAL_FAILED_UNITS_AND_JOURNAL"
+elif [[ "${multi_user_state}" == "active" && "${docker_log_lines}" =~ ^[0-9]+$ ]] && \
+    ((docker_log_lines == 0)); then
+  result_code="DOCKER_LOG_EMPTY"
+  next_action="CHECK_DOCKER_STDOUT_PATH"
+elif [[ "${multi_user_state}" == "active" && "${journal_ready_lines}" =~ ^[0-9]+$ && \
+    "${docker_ready_lines}" =~ ^[0-9]+$ ]] && ((journal_ready_lines > 0 && docker_ready_lines == 0)); then
+  result_code="READY_LOG_NOT_EXPORTED"
+  next_action="CHECK_DOCKER_STDOUT_PATH"
+elif [[ "${multi_user_state}" == "active" && "${journal_ready_lines}" =~ ^[0-9]+$ && \
+    "${docker_ready_lines}" =~ ^[0-9]+$ ]] && ((journal_ready_lines == 0 && docker_ready_lines == 0)); then
+  result_code="READY_MARKER_MISSING"
+  next_action="KIND_SYSTEMD_READINESS_INCOMPATIBLE"
+elif [[ "${docker_ready_lines}" =~ ^[0-9]+$ ]] && ((docker_ready_lines > 0 && kind_wait_log_error == 1)); then
+  result_code="KIND_LOG_WAIT_MISMATCH"
+  next_action="CHECK_KIND_DOCKER_LOG_STREAM"
+elif [[ "${systemd_state}" == "degraded" && "${failed_units}" =~ ^[0-9]+$ ]] && \
+    ((failed_units > 0)); then
+  result_code="SYSTEMD_DEGRADED"
+  next_action="CHECK_LOCAL_FAILED_UNITS"
+elif [[ "${container_state}" == "running" && "${systemd_state}" == "unknown" ]]; then
+  result_code="SYSTEMD_QUERY_FAILED"
+  next_action="CHECK_LOCAL_DOCKER_EXEC"
 fi
 
 {
@@ -375,7 +495,20 @@ fi
   [[ -n "${smoke_exit_code}" ]] && printf 'Kind exit code: %s\n' "${smoke_exit_code}"
   printf 'Docker logging driver: %s\n' "${logging_driver:-unknown}"
   printf 'Host virtualization: %s\n' "${virtualization:-unknown}"
-  printf 'Node OOM state: %s\n\n' "${node_oom:-unknown}"
+  printf 'Node OOM state: %s\n' "${node_oom:-unknown}"
+  printf 'Container state: %s\n' "${container_state}"
+  printf 'Container exit code: %s\n' "${container_exit_code}"
+  printf 'Node log driver: %s\n' "${node_log_driver}"
+  printf 'PID 1: %s\n' "${pid1}"
+  printf 'systemd state: %s\n' "${systemd_state}"
+  printf 'multi-user target: %s\n' "${multi_user_state}"
+  printf 'Failed units: %s\n' "${failed_units}"
+  printf 'Docker log lines: %s\n' "${docker_log_lines}"
+  printf 'Docker readiness lines: %s\n' "${docker_ready_lines}"
+  printf 'Journal readiness lines: %s\n' "${journal_ready_lines}"
+  printf 'Host cgroup version: %s\n' "${host_cgroup_version}"
+  printf 'Container cgroup filesystem: %s\n' "${container_cgroup_fs}"
+  printf 'Next action: %s\n\n' "${next_action}"
 
   if [[ "${result_code}" == "HOST_INFO_ONLY" ]]; then
     printf 'Conclusion: host information was collected without running Kind.\n'
@@ -393,6 +526,8 @@ fi
     printf 'overwrite daemon.json or restart Docker before reviewing existing settings.\n'
   elif [[ "${result_code}" == "NODE_OOM" ]]; then
     printf 'Likely cause: the Kind node was killed by the host out-of-memory mechanism.\n'
+  elif [[ "${result_code}" == "NODE_CONTAINER_EXITED" ]]; then
+    printf 'Likely cause: the Kind node container exited before systemd became ready.\n'
   elif [[ "${result_code}" == "CGROUP_PERMISSION" ]]; then
     printf 'Likely cause: the host cannot provide the privileged mount/cgroup behavior\n'
     printf 'required by a Kind node. Check whether this server is itself a restricted\n'
@@ -400,6 +535,21 @@ fi
   elif [[ "${result_code}" == "NESTED_CONTAINER" ]]; then
     printf 'Likely cause: Kind is running inside a containerized server environment\n'
     printf 'without sufficient nested-container and cgroup delegation support.\n'
+  elif [[ "${result_code}" == "SYSTEMD_NOT_PID1" ]]; then
+    printf 'Likely cause: PID 1 in the Kind node is not systemd.\n'
+  elif [[ "${result_code}" =~ ^(SYSTEMD_NOT_READY|SYSTEMD_FAILED|MULTI_USER_INACTIVE|SYSTEMD_DEGRADED)$ ]]; then
+    printf 'Likely cause: systemd did not reach a healthy multi-user target.\n'
+  elif [[ "${result_code}" == "DOCKER_LOG_EMPTY" ]]; then
+    printf 'Likely cause: the running node produced no Docker stdout logs for Kind to match.\n'
+  elif [[ "${result_code}" == "READY_LOG_NOT_EXPORTED" ]]; then
+    printf 'Likely cause: systemd recorded readiness in journal, but Docker stdout did not.\n'
+  elif [[ "${result_code}" == "READY_MARKER_MISSING" ]]; then
+    printf 'Likely cause: multi-user is active, but neither journal nor Docker logs contain\n'
+    printf 'the readiness marker expected by Kind.\n'
+  elif [[ "${result_code}" == "KIND_LOG_WAIT_MISMATCH" ]]; then
+    printf 'Likely cause: the readiness marker exists, but Kind did not consume it.\n'
+  elif [[ "${result_code}" == "SYSTEMD_QUERY_FAILED" ]]; then
+    printf 'Likely cause: the node runs, but Docker exec could not query systemd.\n'
   else
     printf 'Conclusion: no single cause was identified automatically. Review, in order:\n'
     printf '1. kind-node-state.txt\n'
@@ -413,7 +563,42 @@ fi
     printf 'kind delete cluster --name %q\n' "${cluster_name}"
   fi
 } >"${diagnosis_file}"
-cat "${diagnosis_file}" | tee -a "${summary_file}"
+
+{
+  printf '%s\n' '=== SAFE_KIND_RESULT ==='
+  printf 'RESULT_CODE=%s\n' "${result_code}"
+  printf 'KIND_EXIT=%s\n' "${smoke_exit_code:-not-run}"
+  printf 'CONTAINER_STATE=%s\n' "${container_state}"
+  printf 'CONTAINER_EXIT=%s\n' "${container_exit_code}"
+  printf 'OOM_KILLED=%s\n' "${node_oom}"
+  printf 'NODE_LOG_DRIVER=%s\n' "${node_log_driver}"
+  printf 'PID1=%s\n' "${pid1}"
+  printf 'SYSTEMD_STATE=%s\n' "${systemd_state}"
+  printf 'MULTI_USER=%s\n' "${multi_user_state}"
+  printf 'FAILED_UNITS=%s\n' "${failed_units}"
+  printf 'DOCKER_LOG_LINES=%s\n' "${docker_log_lines}"
+  printf 'DOCKER_READY_LINES=%s\n' "${docker_ready_lines}"
+  printf 'JOURNAL_READY_LINES=%s\n' "${journal_ready_lines}"
+  printf 'HOST_CGROUP_VERSION=%s\n' "${host_cgroup_version}"
+  printf 'CONTAINER_CGROUP_FS=%s\n' "${container_cgroup_fs}"
+  printf 'NEXT_ACTION=%s\n' "${next_action}"
+  if ((cluster_retained == 1)); then
+    printf 'CLEANUP_REQUIRED=yes\n'
+    printf 'CLEANUP_CLUSTER=%s\n' "${cluster_name}"
+  else
+    printf 'CLEANUP_REQUIRED=no\n'
+  fi
+  printf '%s\n' '=== END_SAFE_KIND_RESULT ==='
+} >"${safe_result_file}"
+
+if ((concise_output == 1)); then
+  cat "${diagnosis_file}" >>"${summary_file}"
+  cat "${safe_result_file}"
+else
+  cat "${diagnosis_file}" | tee -a "${summary_file}"
+  printf '\n'
+  cat "${safe_result_file}"
+fi
 
 section "Report archive"
 if ((create_archive == 0)); then

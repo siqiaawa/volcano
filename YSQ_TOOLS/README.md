@@ -36,14 +36,49 @@ git rev-parse HEAD
 chmod +x YSQ_TOOLS/kind-host-diagnose.sh
 ```
 
-在涉密服务器上运行完整检测：
+在涉密服务器上给两个脚本增加执行权限：
 
 ```bash
-./YSQ_TOOLS/kind-host-diagnose.sh --no-archive
+chmod +x YSQ_TOOLS/kind-host-diagnose.sh
+chmod +x YSQ_TOOLS/kind-quick-diagnose.sh
 ```
 
-脚本会使用和项目 E2E 完全相同的 Kubernetes v1.36.1 Kind node image。
-执行可能持续几分钟。结束时会打印只存在于服务器本地的报告目录，例如：
+运行简洁检测入口：
+
+```bash
+./YSQ_TOOLS/kind-quick-diagnose.sh
+```
+
+该入口自动启用 `--confidential`，不会生成压缩包，运行期间只显示开始提示；
+详细日志保留在服务器本地。脚本使用和项目 E2E 完全相同的 Kubernetes v1.36.1
+Kind node image，执行可能持续两分钟左右。
+
+结束时只显示以下固定格式，不显示 hostname、IP 或原始日志：
+
+```text
+=== SAFE_KIND_RESULT ===
+RESULT_CODE=READY_MARKER_MISSING
+KIND_EXIT=1
+CONTAINER_STATE=running
+CONTAINER_EXIT=0
+OOM_KILLED=false
+NODE_LOG_DRIVER=json-file
+PID1=systemd
+SYSTEMD_STATE=running
+MULTI_USER=active
+FAILED_UNITS=0
+DOCKER_LOG_LINES=10
+DOCKER_READY_LINES=0
+JOURNAL_READY_LINES=0
+HOST_CGROUP_VERSION=2
+CONTAINER_CGROUP_FS=cgroup2fs
+NEXT_ACTION=KIND_SYSTEMD_READINESS_INCOMPATIBLE
+CLEANUP_REQUIRED=yes
+CLEANUP_CLUSTER=volcano-kind-debug-时间戳
+=== END_SAFE_KIND_RESULT ===
+```
+
+只需要查看这个短结果区块。详细报告仍只存在于服务器本地，例如：
 
 ```text
 Report directory: /root/volcano-kind-diagnostics/kind-host-diagnostics-20260721-180000
@@ -91,8 +126,19 @@ grep '^RESULT_CODE=' \
 | `PREREQUISITE_MISSING` | kind 或 kubectl 缺失 |
 | `DOCKER_LOGGING_DISABLED` | Docker 日志驱动为 `none` |
 | `NODE_OOM` | Kind 节点被 OOM 杀死 |
+| `NODE_CONTAINER_EXITED` | Kind 节点容器提前退出 |
 | `CGROUP_PERMISSION` | cgroup、mount 或 privileged 权限不足 |
 | `NESTED_CONTAINER` | 服务器本身是受限容器环境 |
+| `SYSTEMD_NOT_PID1` | Kind 节点 PID 1 不是 systemd |
+| `SYSTEMD_NOT_READY` | systemd 一直停留在 starting/initializing |
+| `SYSTEMD_FAILED` | systemd 进入 maintenance/emergency/failed |
+| `MULTI_USER_INACTIVE` | multi-user target 未激活 |
+| `SYSTEMD_DEGRADED` | systemd 已启动但存在失败 unit |
+| `DOCKER_LOG_EMPTY` | 运行中的节点没有 Docker stdout 日志 |
+| `READY_LOG_NOT_EXPORTED` | journal 有就绪标记，但 Docker stdout 没有 |
+| `READY_MARKER_MISSING` | multi-user 已激活，但两类日志都没有 Kind 等待的标记 |
+| `KIND_LOG_WAIT_MISMATCH` | Docker 日志已有标记，但 Kind 没有消费到 |
+| `SYSTEMD_QUERY_FAILED` | 节点运行中，但无法通过 Docker exec 查询 systemd |
 | `UNKNOWN_LOCAL_REVIEW` | 需要在服务器内部继续查看本地日志 |
 
 在单位安全制度允许的前提下，只需记录或口头描述 `RESULT_CODE`，不需要传输报告。
@@ -109,6 +155,24 @@ grep '^RESULT_CODE=' \
 
 ```bash
 ./YSQ_TOOLS/kind-host-diagnose.sh --no-archive
+```
+
+隐藏过程输出，只显示安全结果区块：
+
+```bash
+./YSQ_TOOLS/kind-host-diagnose.sh --concise
+```
+
+同时启用不打包和简洁输出：
+
+```bash
+./YSQ_TOOLS/kind-host-diagnose.sh --confidential
+```
+
+推荐直接使用等价的快捷入口：
+
+```bash
+./YSQ_TOOLS/kind-quick-diagnose.sh
 ```
 
 即使创建成功也保留调试集群：
