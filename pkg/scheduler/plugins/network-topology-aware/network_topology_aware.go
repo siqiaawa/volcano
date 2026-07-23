@@ -591,7 +591,8 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 
 // hyperNodeGradientFn computes network topology gradients by performing BFS traversal from the given HyperNode,
 // filtering and grouping HyperNodes by tier based on resource availability and topology constraints.
-// It returns HyperNodes organized in ascending tier order (lower tiers represent closer network proximity).
+// Each real tree is returned as a contiguous sequence of ascending local-tier gradients; real trees are ordered
+// by root name. A cluster-top numeric boundary retains the legacy cluster-wide tier grouping used by soft mode.
 //
 // Parameters:
 //   - ssn: scheduling session containing all HyperNode information and cluster state
@@ -605,12 +606,69 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 		return nil, err
 	}
 
-	enqueued := set.New[string]()
-
 	searchRoot, err := getSearchRoot(ssn.HyperNodes, hyperNode, topology, allocatedHyperNode)
 	if err != nil {
 		return nil, fmt.Errorf("getSearchRoot failed: %w", err)
 	}
+
+	// Soft topology is currently converted to a numeric hard constraint at
+	// ClusterTopHyperNode. Keep the existing cluster-wide tier grouping
+	// until soft topology gets its own tree-aware placement policy.
+	if searchRoot.Name == framework.ClusterTopHyperNode && topology.HighestTierAllowed != nil &&
+		*topology.HighestTierAllowed >= searchRoot.Tier() {
+		result, _, err := nta.hyperNodeGradientsForSubtree(
+			ssn, searchRoot, topology, allocatedHyperNode, minResource, purpose)
+		return result, err
+	}
+
+	ssn.EnsureTopologyTrees()
+
+	searchRoots := []*api.HyperNodeInfo{searchRoot}
+	if searchRoot.Name == framework.ClusterTopHyperNode {
+		searchRoots = searchRoots[:0]
+		for child := range searchRoot.Children {
+			if _, found := ssn.HyperNodes[child]; !found {
+				return nil, fmt.Errorf("child HyperNode %s of %s not found", child, searchRoot.Name)
+			}
+		}
+		roots := make([]string, 0, len(ssn.TopologyTrees))
+		for root := range ssn.TopologyTrees {
+			roots = append(roots, root)
+		}
+		sort.Strings(roots)
+		for _, root := range roots {
+			rootInfo, found := ssn.HyperNodes[root]
+			if !found {
+				return nil, fmt.Errorf("topology tree root HyperNode %s not found", root)
+			}
+			searchRoots = append(searchRoots, rootInfo)
+		}
+	}
+
+	matchedTierName := topology.HighestTierName == ""
+	var result [][]*api.HyperNodeInfo
+	for _, root := range searchRoots {
+		treeGradients, matched, err := nta.hyperNodeGradientsForSubtree(
+			ssn, root, topology, allocatedHyperNode, minResource, purpose)
+		if err != nil {
+			return nil, err
+		}
+		if matched {
+			matchedTierName = true
+		}
+		result = append(result, treeGradients...)
+	}
+
+	if topology.HighestTierName != "" && !matchedTierName {
+		return nil, fmt.Errorf("tier name %s not found in available HyperNode subtree %s", topology.HighestTierName, searchRoot.Name)
+	}
+	return result, nil
+}
+
+// hyperNodeGradientsForSubtree builds gradients for one search subtree. The
+// caller invokes it separately for each real tree in tree-aware hard mode.
+func (nta *networkTopologyAwarePlugin) hyperNodeGradientsForSubtree(ssn *framework.Session, searchRoot *api.HyperNodeInfo, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string, minResource *api.Resource, purpose api.SearchPurpose) ([][]*api.HyperNodeInfo, bool, error) {
+	enqueued := set.New[string]()
 
 	type searchItem struct {
 		hyperNode         *api.HyperNodeInfo
@@ -619,9 +677,10 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 
 	nameBoundaryFound := false
 	if topology.HighestTierName != "" {
+		var err error
 		nameBoundaryFound, err = hasUniqueTierNameOnAncestorChain(ssn.HyperNodes, searchRoot.Name, topology.HighestTierName)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	processQueue := []searchItem{{hyperNode: searchRoot, nameBoundaryFound: nameBoundaryFound}}
@@ -644,18 +703,20 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 		}
 
 		// push children hyperNode into queue
-		for child := range current.Children {
+		children := current.Children.UnsortedList()
+		sort.Strings(children)
+		for _, child := range children {
 			if enqueued.Has(child) {
 				continue
 			}
 			childInfo, found := ssn.HyperNodes[child]
 			if !found {
-				return nil, fmt.Errorf("child HyperNode %s of %s not found", child, current.Name)
+				return nil, false, fmt.Errorf("child HyperNode %s of %s not found", child, current.Name)
 			}
 			childBoundaryFound := item.nameBoundaryFound
 			if topology.HighestTierName != "" && childInfo.TierName() == topology.HighestTierName {
 				if childBoundaryFound {
-					return nil, fmt.Errorf("tier name %s appears more than once in the ancestor chain of HyperNode %s", topology.HighestTierName, child)
+					return nil, false, fmt.Errorf("tier name %s appears more than once in the ancestor chain of HyperNode %s", topology.HighestTierName, child)
 				}
 				childBoundaryFound = true
 				matchedTierName = true
@@ -664,10 +725,6 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 			enqueued.Insert(child)
 		}
 	}
-	if topology.HighestTierName != "" && !matchedTierName {
-		return nil, fmt.Errorf("tier name %s not found in available HyperNode subtree %s", topology.HighestTierName, searchRoot.Name)
-	}
-
 	// organize hyperNode gradients by tiers in ascending order
 	var tiers []int
 	for tier := range eligibleHyperNodes {
@@ -677,10 +734,13 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 
 	var result [][]*api.HyperNodeInfo
 	for _, tier := range tiers {
+		sort.Slice(eligibleHyperNodes[tier], func(i, j int) bool {
+			return eligibleHyperNodes[tier][i].Name < eligibleHyperNodes[tier][j].Name
+		})
 		result = append(result, eligibleHyperNodes[tier])
 	}
 
-	return result, nil
+	return result, matchedTierName, nil
 }
 
 func (nta *networkTopologyAwarePlugin) isEligibleHyperNode(hn *api.HyperNodeInfo, allocatedHyperNode string, minResource *api.Resource, purpose api.SearchPurpose) bool {

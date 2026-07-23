@@ -3470,6 +3470,17 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 		}
 		return names
 	}
+	gradientNames := func(gradients [][]*api.HyperNodeInfo) [][]string {
+		result := make([][]string, 0, len(gradients))
+		for _, gradient := range gradients {
+			names := make([]string, 0, len(gradient))
+			for _, hyperNode := range gradient {
+				names = append(names, hyperNode.Name)
+			}
+			result = append(result, names)
+		}
+		return result
+	}
 
 	gradients, err := plugin.hyperNodeGradientFn(
 		ssn, hyperNodes[framework.ClusterTopHyperNode], networkTopology, "", nil, api.PurposeAllocate)
@@ -3486,6 +3497,45 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 	assert.True(t, candidates.Has("a5-superpod-0"), "A5 descendants below the boundary should remain eligible")
 	assert.False(t, candidates.Has("a5-hypercluster"),
 		"A5 must not cross the hypernode boundary into hypercluster")
+	assert.Equal(t, [][]string{
+		{"a3-hypernode-0", "a3-hypernode-1"},
+		{"a5-superpod-0", "a5-superpod-1"},
+		{"a5-hypernode"},
+	}, gradientNames(gradients), "each tree should contribute its own ascending local-tier gradients")
+
+	t.Run("numeric tiers remain isolated by real tree", func(t *testing.T) {
+		highestTierAllowed := 2
+		topology := &scheduling.NetworkTopologySpec{
+			Mode:               scheduling.HardNetworkTopologyMode,
+			HighestTierAllowed: &highestTierAllowed,
+		}
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
+		assert.NoError(t, err)
+		assert.Equal(t, [][]string{
+			{"a3-hypernode-0", "a3-hypernode-1"},
+			{"a3-hypercluster"},
+			{"a5-superpod-0", "a5-superpod-1"},
+			{"a5-hypernode"},
+		}, gradientNames(gradients))
+	})
+
+	t.Run("cluster-top numeric boundary preserves legacy soft fallback", func(t *testing.T) {
+		highestTierAllowed := hyperNodes[framework.ClusterTopHyperNode].Tier()
+		topology := &scheduling.NetworkTopologySpec{
+			Mode:               scheduling.HardNetworkTopologyMode,
+			HighestTierAllowed: &highestTierAllowed,
+		}
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
+		assert.NoError(t, err)
+		assert.Equal(t, [][]string{
+			{"a3-hypernode-0", "a3-hypernode-1", "a5-superpod-0", "a5-superpod-1"},
+			{"a3-hypercluster", "a5-hypernode"},
+			{"a5-hypercluster"},
+			{framework.ClusterTopHyperNode},
+		}, gradientNames(gradients))
+	})
 
 	t.Run("branch without requested tier name is excluded", func(t *testing.T) {
 		topology := &scheduling.NetworkTopologySpec{
@@ -3505,6 +3555,10 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 		gradients, err := plugin.hyperNodeGradientFn(
 			ssn, hyperNodes[framework.ClusterTopHyperNode], networkTopology, "a5-superpod-0", nil, api.PurposeAllocate)
 		assert.NoError(t, err)
+		assert.Equal(t, [][]string{
+			{"a5-superpod-0", "a5-superpod-1"},
+			{"a5-hypernode"},
+		}, gradientNames(gradients), "a partially running job must remain in the allocated tree")
 		candidates := collectNames(gradients)
 		assert.True(t, candidates.Has("a5-hypernode"))
 		assert.True(t, candidates.Has("a5-superpod-1"))

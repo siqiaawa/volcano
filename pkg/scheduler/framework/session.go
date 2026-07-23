@@ -62,6 +62,17 @@ const (
 	ClusterTopHyperNode = "<cluster-top-hypernode>"
 )
 
+// TopologyTree describes one real, connected HyperNode tree below the virtual
+// ClusterTopHyperNode. Tier indexes are scoped to the tree and must not be used
+// to merge scheduling candidates from different trees.
+type TopologyTree struct {
+	Root       string
+	HyperNodes sets.Set[string]
+	ByTier     map[int]sets.Set[string]
+	Tiers      []int
+	RealNodes  sets.Set[string]
+}
+
 // Session information for the current session
 type Session struct {
 	UID types.UID
@@ -107,6 +118,10 @@ type Session struct {
 	// hyperNode can gain a better performance, the lower the tier of hyperNode, the better performance.
 	HyperNodesSetByTier map[int]sets.Set[string]
 	HyperNodesTiers     []int
+	// TopologyTrees and HyperNodeToTopologyTree preserve the real tree boundary
+	// hidden by ClusterTopHyperNode.
+	TopologyTrees           map[string]*TopologyTree
+	HyperNodeToTopologyTree map[string]string
 	// RealNodesList maps hyperNode Name -> nodes under the hyperNode.
 	RealNodesList             map[string][]*api.NodeInfo
 	RealNodesSet              map[string]sets.Set[string]
@@ -244,6 +259,7 @@ func openSession(cache cache.Cache) *Session {
 	ssn.RealNodesList, ssn.RealNodesSet = util.GetRealNodesByHyperNode(snapshot.RealNodesSet, snapshot.Nodes)
 	ssn.HyperNodesReadyToSchedule = snapshot.HyperNodesReadyToSchedule
 	ssn.addClusterTopHyperNode(ssn.NodeList)
+	ssn.buildTopologyTrees()
 	ssn.parseHyperNodesTiers()
 	ssn.adjustNetworkTopologySpec()
 
@@ -312,6 +328,145 @@ func (ssn *Session) addClusterTopHyperNode(nodes []*api.NodeInfo) {
 	for _, node := range nodes {
 		ssn.RealNodesSet[topHni.Name].Insert(node.Name)
 	}
+}
+
+// EnsureTopologyTrees lazily builds the real topology tree view for tests and
+// callers that construct a Session without going through openSession.
+func (ssn *Session) EnsureTopologyTrees() {
+	if ssn.topologyTreesCurrent() {
+		return
+	}
+	ssn.buildTopologyTrees()
+}
+
+func (ssn *Session) topologyTreesCurrent() bool {
+	if ssn.TopologyTrees == nil || ssn.HyperNodeToTopologyTree == nil {
+		return false
+	}
+
+	realHyperNodeCount := 0
+	for name := range ssn.HyperNodes {
+		if name == ClusterTopHyperNode {
+			continue
+		}
+		realHyperNodeCount++
+		root, found := ssn.HyperNodeToTopologyTree[name]
+		if !found {
+			return false
+		}
+		tree, found := ssn.TopologyTrees[root]
+		if !found || !tree.HyperNodes.Has(name) {
+			return false
+		}
+	}
+
+	return len(ssn.HyperNodeToTopologyTree) == realHyperNodeCount
+}
+
+func (ssn *Session) buildTopologyTrees() {
+	ssn.TopologyTrees = make(map[string]*TopologyTree)
+	ssn.HyperNodeToTopologyTree = make(map[string]string)
+	if len(ssn.HyperNodes) == 0 {
+		return
+	}
+
+	rootSet := sets.New[string]()
+	if clusterRoot, found := ssn.HyperNodes[ClusterTopHyperNode]; found {
+		for child := range clusterRoot.Children {
+			if child != ClusterTopHyperNode {
+				rootSet.Insert(child)
+			}
+		}
+		for name, hyperNode := range ssn.HyperNodes {
+			if name != ClusterTopHyperNode && hyperNode.Parent == ClusterTopHyperNode {
+				rootSet.Insert(name)
+			}
+		}
+	} else {
+		children := sets.New[string]()
+		for _, hyperNode := range ssn.HyperNodes {
+			children.Insert(hyperNode.Children.UnsortedList()...)
+		}
+		for name, hyperNode := range ssn.HyperNodes {
+			if hyperNode.Parent == "" && !children.Has(name) {
+				rootSet.Insert(name)
+			}
+		}
+	}
+
+	roots := rootSet.UnsortedList()
+	sort.Strings(roots)
+	for _, root := range roots {
+		ssn.addTopologyTree(root)
+	}
+
+	// Keep malformed or temporarily disconnected components visible. The
+	// gradient builder still reports missing children when traversing a tree.
+	remaining := make([]string, 0)
+	for name := range ssn.HyperNodes {
+		if name != ClusterTopHyperNode {
+			if _, found := ssn.HyperNodeToTopologyTree[name]; !found {
+				remaining = append(remaining, name)
+			}
+		}
+	}
+	sort.Strings(remaining)
+	for _, root := range remaining {
+		if _, found := ssn.HyperNodeToTopologyTree[root]; !found {
+			ssn.addTopologyTree(root)
+		}
+	}
+}
+
+func (ssn *Session) addTopologyTree(root string) {
+	if root == ClusterTopHyperNode {
+		return
+	}
+	if _, found := ssn.HyperNodes[root]; !found {
+		return
+	}
+
+	tree := &TopologyTree{
+		Root:       root,
+		HyperNodes: sets.New[string](),
+		ByTier:     make(map[int]sets.Set[string]),
+		RealNodes:  sets.New[string](),
+	}
+	queue := []string{root}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if name == ClusterTopHyperNode || tree.HyperNodes.Has(name) {
+			continue
+		}
+		if _, assigned := ssn.HyperNodeToTopologyTree[name]; assigned {
+			continue
+		}
+
+		hyperNode, found := ssn.HyperNodes[name]
+		if !found {
+			continue
+		}
+		tree.HyperNodes.Insert(name)
+		ssn.HyperNodeToTopologyTree[name] = root
+		if tree.ByTier[hyperNode.Tier()] == nil {
+			tree.ByTier[hyperNode.Tier()] = sets.New[string]()
+		}
+		tree.ByTier[hyperNode.Tier()].Insert(name)
+		for nodeName := range ssn.RealNodesSet[name] {
+			tree.RealNodes.Insert(nodeName)
+		}
+
+		children := hyperNode.Children.UnsortedList()
+		sort.Strings(children)
+		queue = append(queue, children...)
+	}
+
+	for tier := range tree.ByTier {
+		tree.Tiers = append(tree.Tiers, tier)
+	}
+	sort.Ints(tree.Tiers)
+	ssn.TopologyTrees[root] = tree
 }
 
 // removeInvalidAllocatedHyperNode removes the non-existent allocated hyperNode for job and subJobs in the job.

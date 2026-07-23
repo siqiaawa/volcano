@@ -5,12 +5,56 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
+
+func TestSessionEnsureTopologyTrees(t *testing.T) {
+	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
+		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+		info.Children.Insert(children...)
+		return info
+	}
+
+	hyperNodes := api.HyperNodeInfoMap{
+		"a3-leaf":           newHyperNode("a3-leaf", 1),
+		"a3-root":           newHyperNode("a3-root", 2, "a3-leaf"),
+		"a5-leaf":           newHyperNode("a5-leaf", 1),
+		"a5-middle":         newHyperNode("a5-middle", 2, "a5-leaf"),
+		"a5-root":           newHyperNode("a5-root", 3, "a5-middle"),
+		ClusterTopHyperNode: newHyperNode(ClusterTopHyperNode, 4, "a3-root", "a5-root"),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+
+	ssn := &Session{
+		HyperNodes: hyperNodes,
+		RealNodesSet: map[string]sets.Set[string]{
+			"a3-root": sets.New("a3-node"),
+			"a5-root": sets.New("a5-node"),
+		},
+	}
+	ssn.EnsureTopologyTrees()
+
+	assert.Equal(t, sets.New("a3-root", "a5-root"), sets.KeySet(ssn.TopologyTrees))
+	assert.Equal(t, []int{1, 2}, ssn.TopologyTrees["a3-root"].Tiers)
+	assert.Equal(t, []int{1, 2, 3}, ssn.TopologyTrees["a5-root"].Tiers)
+	assert.Equal(t, sets.New("a3-root", "a3-leaf"), ssn.TopologyTrees["a3-root"].HyperNodes)
+	assert.Equal(t, sets.New("a5-root", "a5-middle", "a5-leaf"), ssn.TopologyTrees["a5-root"].HyperNodes)
+	assert.Equal(t, sets.New("a3-node"), ssn.TopologyTrees["a3-root"].RealNodes)
+	assert.Equal(t, sets.New("a5-node"), ssn.TopologyTrees["a5-root"].RealNodes)
+	assert.Equal(t, "a3-root", ssn.HyperNodeToTopologyTree["a3-leaf"])
+	assert.Equal(t, "a5-root", ssn.HyperNodeToTopologyTree["a5-middle"])
+	_, clusterRootIndexed := ssn.HyperNodeToTopologyTree[ClusterTopHyperNode]
+	assert.False(t, clusterRootIndexed)
+}
 
 func TestSession_adjustNetworkTopologySpec(t *testing.T) {
 	tests := []struct {
