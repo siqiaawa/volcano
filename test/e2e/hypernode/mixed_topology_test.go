@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 
 	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	e2eutil "volcano.sh/volcano/test/e2e/util"
@@ -178,14 +179,64 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 				Tolerations: mixedTopologyTolerations,
 			}},
 		})
-		defer func() {
-			e2eutil.DeleteJob(testCtx, crossTreeJob)
-		}()
 		Expect(e2eutil.WaitJobReady(testCtx, crossTreeJob)).NotTo(HaveOccurred())
 		hasA3, hasA5, err = mixedTopologyJobUsesProfiles(testCtx, crossTreeJob)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(hasA3).To(BeTrue(), "virtual-root fallback should use the A3 tree")
 		Expect(hasA5).To(BeTrue(), "virtual-root fallback should use the A5 tree")
+		e2eutil.DeleteJob(testCtx, crossTreeJob)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, crossTreeJob)).NotTo(HaveOccurred())
+
+		By("keeping the entire gang pending when mixed-tree total capacity is insufficient")
+		insufficientJob := e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
+			Name: "mixed-soft-insufficient-job",
+			NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+				Mode: batchv1alpha1.SoftNetworkTopologyMode,
+			},
+			Tasks: []e2eutil.TaskSpec{{
+				Name:        "worker",
+				Img:         e2eutil.DefaultNginxImage,
+				Req:         e2eutil.CPU5Mem5,
+				Min:         9,
+				Rep:         9,
+				Tolerations: mixedTopologyTolerations,
+				Affinity: &v1.Affinity{
+					NodeAffinity: &v1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+							NodeSelectorTerms: []v1.NodeSelectorTerm{{
+								MatchExpressions: []v1.NodeSelectorRequirement{{
+									Key:      mixedProfileLabel,
+									Operator: v1.NodeSelectorOpIn,
+									Values:   []string{"a3", "a5"},
+								}},
+							}},
+						},
+					},
+				},
+			}},
+		})
+		defer e2eutil.DeleteJob(testCtx, insufficientJob)
+		Expect(e2eutil.WaitTaskPhase(testCtx, insufficientJob, []v1.PodPhase{v1.PodPending}, 9)).NotTo(HaveOccurred())
+		Consistently(func() (bool, error) {
+			pods, err := testCtx.Kubeclient.CoreV1().Pods(insufficientJob.Namespace).List(
+				context.Background(), metav1.ListOptions{})
+			if err != nil {
+				return false, err
+			}
+			controlledPods := 0
+			for i := range pods.Items {
+				pod := &pods.Items[i]
+				if !metav1.IsControlledBy(pod, insufficientJob) {
+					continue
+				}
+				controlledPods++
+				if pod.Spec.NodeName != "" || pod.Status.Phase != v1.PodPending {
+					return false, nil
+				}
+			}
+			return controlledPods == 9, nil
+		}, 5*time.Second, 250*time.Millisecond).Should(BeTrue(),
+			"an unsatisfied soft gang must not partially bind across A3 and A5")
 	})
 })
 
@@ -240,21 +291,18 @@ func labelMixedTopologyNodes(client kubernetes.Interface) (map[string]*v1.Node, 
 			return nil, err
 		}
 		originals[name] = node.DeepCopy()
-		node = node.DeepCopy()
-		if node.Labels == nil {
-			node.Labels = make(map[string]string)
-		}
-		if i < 4 {
-			node.Labels[mixedProfileLabel] = "a3"
-			node.Labels[mixedA3ClusterLabel] = "hc-a3"
-			node.Labels[mixedA3HyperNodeLabel] = fmt.Sprintf("hn-a3-%d", i/2)
-		} else {
-			node.Labels[mixedProfileLabel] = "a5"
-			node.Labels[mixedA5ClusterLabel] = "hc-a5"
-			node.Labels[mixedA5HyperNodeLabel] = "hn-a5"
-			node.Labels[mixedA5SuperPodLabel] = fmt.Sprintf("sp-a5-%d", (i-4)/2)
-		}
-		if _, err := client.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{}); err != nil {
+		if err := updateNodeLabels(client, name, func(labels map[string]string) {
+			if i < 4 {
+				labels[mixedProfileLabel] = "a3"
+				labels[mixedA3ClusterLabel] = "hc-a3"
+				labels[mixedA3HyperNodeLabel] = fmt.Sprintf("hn-a3-%d", i/2)
+			} else {
+				labels[mixedProfileLabel] = "a5"
+				labels[mixedA5ClusterLabel] = "hc-a5"
+				labels[mixedA5HyperNodeLabel] = "hn-a5"
+				labels[mixedA5SuperPodLabel] = fmt.Sprintf("sp-a5-%d", (i-4)/2)
+			}
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -263,13 +311,16 @@ func labelMixedTopologyNodes(client kubernetes.Interface) (map[string]*v1.Node, 
 
 func restoreNodeLabels(client kubernetes.Interface, originals map[string]*v1.Node) error {
 	for name, original := range originals {
-		current, err := client.CoreV1().Nodes().Get(context.Background(), name, metav1.GetOptions{})
-		if err != nil {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			current, err := client.CoreV1().Nodes().Get(context.Background(), name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			current = current.DeepCopy()
+			current.Labels = original.Labels
+			_, err = client.CoreV1().Nodes().Update(context.Background(), current, metav1.UpdateOptions{})
 			return err
-		}
-		current = current.DeepCopy()
-		current.Labels = original.Labels
-		if _, err := client.CoreV1().Nodes().Update(context.Background(), current, metav1.UpdateOptions{}); err != nil {
+		}); err != nil {
 			return err
 		}
 	}
@@ -277,17 +328,25 @@ func restoreNodeLabels(client kubernetes.Interface, originals map[string]*v1.Nod
 }
 
 func setNodeLabel(client kubernetes.Interface, nodeName, key, value string) error {
-	node, err := client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
-	if err != nil {
+	return updateNodeLabels(client, nodeName, func(labels map[string]string) {
+		labels[key] = value
+	})
+}
+
+func updateNodeLabels(client kubernetes.Interface, nodeName string, update func(map[string]string)) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		node, err := client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		node = node.DeepCopy()
+		if node.Labels == nil {
+			node.Labels = make(map[string]string)
+		}
+		update(node.Labels)
+		_, err = client.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
 		return err
-	}
-	node = node.DeepCopy()
-	if node.Labels == nil {
-		node.Labels = make(map[string]string)
-	}
-	node.Labels[key] = value
-	_, err = client.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
-	return err
+	})
 }
 
 func mixedTopologyHasExpectedTiers(testCtx *e2eutil.TestContext, expectedCount int, expectedDomain string) (bool, error) {
