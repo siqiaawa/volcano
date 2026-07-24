@@ -569,7 +569,7 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 	scoreToNodes := map[float64][]string{}
 	for _, node := range nodes {
 		hyperNode := util.FindHyperNodeForNode(node.Name, ssn.RealNodesList, ssn.HyperNodesTiers, ssn.HyperNodesSetByTier)
-		score := nta.networkTopologyAwareScore(hyperNode, allocatedHyperNode, ssn.HyperNodes)
+		score := nta.networkTopologyAwareScore(hyperNode, allocatedHyperNode, ssn)
 		nodeScores[node.Name] = score
 		if score >= maxScore {
 			maxScore = score
@@ -907,20 +907,33 @@ func (nta *networkTopologyAwarePlugin) reverseAndCapEvictionGradients(gradients 
 
 // Goals:
 // - The tier of LCAHyperNode of the hyperNode and the job allocatedHyperNode should be as low as possible.
-func (nta *networkTopologyAwarePlugin) networkTopologyAwareScore(hyperNodeName, jobAllocatedHyperNode string, hyperNodeMap api.HyperNodeInfoMap) float64 {
+func (nta *networkTopologyAwarePlugin) networkTopologyAwareScore(hyperNodeName, jobAllocatedHyperNode string, ssn *framework.Session) float64 {
 	if hyperNodeName == "" || jobAllocatedHyperNode == "" {
 		return ZeroScore
 	}
 	if hyperNodeName == jobAllocatedHyperNode {
 		return FullScore
 	}
+	hyperNodeMap := ssn.HyperNodes
 	LCAHyperNode := hyperNodeMap.GetLCAHyperNode(hyperNodeName, jobAllocatedHyperNode)
 	hyperNodeInfo, ok := hyperNodeMap[LCAHyperNode]
 	if !ok {
 		return ZeroScore
 	}
+
+	minTier, maxTier := nta.minTier, nta.maxTier
+	ssn.EnsureTopologyTrees()
+	if root, found := ssn.HyperNodeToTopologyTree[jobAllocatedHyperNode]; found {
+		if tree, found := ssn.TopologyTrees[root]; found && len(tree.Tiers) > 0 {
+			minTier = tree.Tiers[0]
+			// Use a virtual boundary immediately above this real root. This
+			// preserves the legacy single-tree scale without allowing a deeper
+			// sibling tree to inflate scores in a shallower tree.
+			maxTier = tree.Tiers[len(tree.Tiers)-1] + 1
+		}
+	}
 	// Calculate score: (maxTier - LCAhyperNode.tier)/(maxTier - minTier)
-	hyperNodeTierScore := nta.scoreHyperNodeWithTier(hyperNodeInfo.Tier())
+	hyperNodeTierScore := scoreHyperNodeWithTierRange(hyperNodeInfo.Tier(), minTier, maxTier)
 	return hyperNodeTierScore
 }
 
@@ -936,13 +949,13 @@ func (nta *networkTopologyAwarePlugin) scoreWithTaskNum(hyperNodeName string, ta
 	return taskNumScore
 }
 
-func (nta *networkTopologyAwarePlugin) scoreHyperNodeWithTier(tier int) float64 {
+func scoreHyperNodeWithTierRange(tier, minTier, maxTier int) float64 {
 	// Use tier to calculate scores and map the original score to the range between 0 and 1.
-	if nta.minTier == nta.maxTier {
+	if minTier == maxTier {
 		return FullScore
 	}
-	if nta.minTier <= tier && tier <= nta.maxTier {
-		return float64(nta.maxTier-tier) / float64(nta.maxTier-nta.minTier)
+	if minTier <= tier && tier <= maxTier {
+		return float64(maxTier-tier) / float64(maxTier-minTier)
 	}
 	return ZeroScore
 }

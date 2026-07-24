@@ -3537,7 +3537,7 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 		}, gradientNames(gradients))
 	})
 
-	t.Run("soft tries a feasible real tree before the virtual root", func(t *testing.T) {
+	t.Run("converted soft tries a feasible real tree before the virtual root", func(t *testing.T) {
 		originalCache := plugin.hyperNodeResourceCache
 		defer func() {
 			plugin.hyperNodeResourceCache = originalCache
@@ -3573,7 +3573,7 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 		}, gradientNames(gradients))
 	})
 
-	t.Run("soft falls back to the virtual root for combined capacity", func(t *testing.T) {
+	t.Run("converted soft falls back to the virtual root for combined capacity", func(t *testing.T) {
 		originalCache := plugin.hyperNodeResourceCache
 		defer func() {
 			plugin.hyperNodeResourceCache = originalCache
@@ -3602,6 +3602,35 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 		assert.Equal(t, [][]string{
 			{framework.ClusterTopHyperNode},
 		}, gradientNames(gradients))
+	})
+
+	t.Run("converted soft returns no candidate when total capacity is insufficient", func(t *testing.T) {
+		originalCache := plugin.hyperNodeResourceCache
+		defer func() {
+			plugin.hyperNodeResourceCache = originalCache
+		}()
+
+		plugin.hyperNodeResourceCache = make(map[string]*resourceStatus, len(hyperNodes))
+		for name := range hyperNodes {
+			plugin.hyperNodeResourceCache[name] = &resourceStatus{
+				idle:       api.EmptyResource(),
+				futureIdle: api.EmptyResource(),
+			}
+		}
+		plugin.hyperNodeResourceCache[framework.ClusterTopHyperNode] = &resourceStatus{
+			idle:       &api.Resource{MilliCPU: 3},
+			futureIdle: &api.Resource{MilliCPU: 3},
+		}
+
+		highestTierAllowed := hyperNodes[framework.ClusterTopHyperNode].Tier()
+		topology := &scheduling.NetworkTopologySpec{
+			Mode:               scheduling.HardNetworkTopologyMode,
+			HighestTierAllowed: &highestTierAllowed,
+		}
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", &api.Resource{MilliCPU: 4}, api.PurposeAllocate)
+		assert.NoError(t, err)
+		assert.Empty(t, gradients, "the virtual root must not fabricate capacity for an unsatisfied gang")
 	})
 
 	t.Run("branch without requested tier name is excluded", func(t *testing.T) {
@@ -4172,4 +4201,44 @@ func TestHyperNodeGradientForSubJobFn_NoSubJobPolicyRespectsHardTopology(t *test
 
 	gradients := ssn.HyperNodeGradientForSubJobFn(subJob, ssn.HyperNodes[rootName], api.PurposeEvict)
 	assert.Empty(t, gradients, "hard topology without feasible tier-1 domain should not fallback to root")
+}
+
+func TestNetworkTopologyAwareScoreMixedTreeUsesLocalDepth(t *testing.T) {
+	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
+		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+		info.Children.Insert(children...)
+		return info
+	}
+
+	hyperNodes := api.HyperNodeInfoMap{
+		"a3-leaf-0": newHyperNode("a3-leaf-0", 1),
+		"a3-leaf-1": newHyperNode("a3-leaf-1", 1),
+		"a3-root":   newHyperNode("a3-root", 2, "a3-leaf-0", "a3-leaf-1"),
+		"a5-leaf-0": newHyperNode("a5-leaf-0", 1),
+		"a5-leaf-1": newHyperNode("a5-leaf-1", 1),
+		"a5-middle": newHyperNode("a5-middle", 2, "a5-leaf-0", "a5-leaf-1"),
+		"a5-root":   newHyperNode("a5-root", 3, "a5-middle"),
+		framework.ClusterTopHyperNode: newHyperNode(
+			framework.ClusterTopHyperNode, 4, "a3-root", "a5-root"),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+
+	plugin := &networkTopologyAwarePlugin{
+		hyperNodesTier: &hyperNodesTier{minTier: 1, maxTier: 4},
+	}
+	ssn := &framework.Session{HyperNodes: hyperNodes}
+
+	assert.InDelta(t, 0.5,
+		plugin.networkTopologyAwareScore("a3-leaf-1", "a3-leaf-0", ssn), 1e-9,
+		"the deeper A5 tree must not inflate an A3-local LCA score")
+	assert.InDelta(t, 2.0/3.0,
+		plugin.networkTopologyAwareScore("a5-leaf-1", "a5-leaf-0", ssn), 1e-9,
+		"A5 should retain its own three-level distance scale")
+	assert.Equal(t, ZeroScore,
+		plugin.networkTopologyAwareScore("a5-leaf-0", "a3-leaf-0", ssn),
+		"nodes in another connected tree must not receive an affinity score")
 }
