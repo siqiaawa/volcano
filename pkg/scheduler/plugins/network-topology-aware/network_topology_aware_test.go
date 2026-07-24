@@ -3537,6 +3537,73 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 		}, gradientNames(gradients))
 	})
 
+	t.Run("soft tries a feasible real tree before the virtual root", func(t *testing.T) {
+		originalCache := plugin.hyperNodeResourceCache
+		defer func() {
+			plugin.hyperNodeResourceCache = originalCache
+		}()
+
+		plugin.hyperNodeResourceCache = make(map[string]*resourceStatus, len(hyperNodes))
+		for name := range hyperNodes {
+			plugin.hyperNodeResourceCache[name] = &resourceStatus{
+				idle:       api.EmptyResource(),
+				futureIdle: api.EmptyResource(),
+			}
+		}
+		plugin.hyperNodeResourceCache["a5-hypercluster"] = &resourceStatus{
+			idle:       &api.Resource{MilliCPU: 4},
+			futureIdle: &api.Resource{MilliCPU: 4},
+		}
+		plugin.hyperNodeResourceCache[framework.ClusterTopHyperNode] = &resourceStatus{
+			idle:       &api.Resource{MilliCPU: 8},
+			futureIdle: &api.Resource{MilliCPU: 8},
+		}
+
+		highestTierAllowed := hyperNodes[framework.ClusterTopHyperNode].Tier()
+		topology := &scheduling.NetworkTopologySpec{
+			Mode:               scheduling.HardNetworkTopologyMode,
+			HighestTierAllowed: &highestTierAllowed,
+		}
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", &api.Resource{MilliCPU: 4}, api.PurposeAllocate)
+		assert.NoError(t, err)
+		assert.Equal(t, [][]string{
+			{"a5-hypercluster"},
+			{framework.ClusterTopHyperNode},
+		}, gradientNames(gradients))
+	})
+
+	t.Run("soft falls back to the virtual root for combined capacity", func(t *testing.T) {
+		originalCache := plugin.hyperNodeResourceCache
+		defer func() {
+			plugin.hyperNodeResourceCache = originalCache
+		}()
+
+		plugin.hyperNodeResourceCache = make(map[string]*resourceStatus, len(hyperNodes))
+		for name := range hyperNodes {
+			plugin.hyperNodeResourceCache[name] = &resourceStatus{
+				idle:       api.EmptyResource(),
+				futureIdle: api.EmptyResource(),
+			}
+		}
+		plugin.hyperNodeResourceCache[framework.ClusterTopHyperNode] = &resourceStatus{
+			idle:       &api.Resource{MilliCPU: 8},
+			futureIdle: &api.Resource{MilliCPU: 8},
+		}
+
+		highestTierAllowed := hyperNodes[framework.ClusterTopHyperNode].Tier()
+		topology := &scheduling.NetworkTopologySpec{
+			Mode:               scheduling.HardNetworkTopologyMode,
+			HighestTierAllowed: &highestTierAllowed,
+		}
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", &api.Resource{MilliCPU: 4}, api.PurposeAllocate)
+		assert.NoError(t, err)
+		assert.Equal(t, [][]string{
+			{framework.ClusterTopHyperNode},
+		}, gradientNames(gradients))
+	})
+
 	t.Run("branch without requested tier name is excluded", func(t *testing.T) {
 		topology := &scheduling.NetworkTopologySpec{
 			Mode:            scheduling.HardNetworkTopologyMode,

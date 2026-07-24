@@ -122,6 +122,71 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
 		}, 60*time.Second, time.Second).Should(BeTrue())
 	})
+
+	It("keeps soft jobs in one tree when possible and uses the virtual root as fallback", func() {
+		controllerConfigMap, err := findControllerConfigMap(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		originalControllerConfig := controllerConfigMap.Data["volcano-controller.conf"]
+
+		originalNodes, err := labelMixedTopologyNodes(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		defer func() {
+			Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, originalControllerConfig)).To(Succeed())
+			Expect(restoreNodeLabels(testCtx.Kubeclient, originalNodes)).To(Succeed())
+		}()
+
+		By("enabling A3 and A5 label discovery profiles")
+		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, mixedTopologyDiscoveryConfig())).To(Succeed())
+		Eventually(func() (bool, error) {
+			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
+		}, 60*time.Second, time.Second).Should(BeTrue())
+
+		By("scheduling a soft job entirely within one real topology tree")
+		singleTreeJob := e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
+			Name: "mixed-soft-single-tree-job",
+			NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+				Mode: batchv1alpha1.SoftNetworkTopologyMode,
+			},
+			Tasks: []e2eutil.TaskSpec{{
+				Name:        "worker",
+				Img:         e2eutil.DefaultNginxImage,
+				Req:         e2eutil.CPU5Mem5,
+				Min:         4,
+				Rep:         4,
+				Tolerations: mixedTopologyTolerations,
+			}},
+		})
+		Expect(e2eutil.WaitJobReady(testCtx, singleTreeJob)).NotTo(HaveOccurred())
+		hasA3, hasA5, err := mixedTopologyJobUsesProfiles(testCtx, singleTreeJob)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasA3 != hasA5).To(BeTrue(), "a soft job that fits in one tree must not span A3 and A5")
+		e2eutil.DeleteJob(testCtx, singleTreeJob)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, singleTreeJob)).NotTo(HaveOccurred())
+
+		By("scheduling a soft job across trees only when neither real tree is sufficient")
+		crossTreeJob := e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
+			Name: "mixed-soft-cross-tree-job",
+			NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+				Mode: batchv1alpha1.SoftNetworkTopologyMode,
+			},
+			Tasks: []e2eutil.TaskSpec{{
+				Name:        "worker",
+				Img:         e2eutil.DefaultNginxImage,
+				Req:         e2eutil.CPU5Mem5,
+				Min:         8,
+				Rep:         8,
+				Tolerations: mixedTopologyTolerations,
+			}},
+		})
+		defer func() {
+			e2eutil.DeleteJob(testCtx, crossTreeJob)
+		}()
+		Expect(e2eutil.WaitJobReady(testCtx, crossTreeJob)).NotTo(HaveOccurred())
+		hasA3, hasA5, err = mixedTopologyJobUsesProfiles(testCtx, crossTreeJob)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasA3).To(BeTrue(), "virtual-root fallback should use the A3 tree")
+		Expect(hasA5).To(BeTrue(), "virtual-root fallback should use the A5 tree")
+	})
 })
 
 func findControllerConfigMap(client kubernetes.Interface) (*v1.ConfigMap, error) {
@@ -255,6 +320,29 @@ func mixedTopologyHasExpectedTiers(testCtx *e2eutil.TestContext, expectedCount i
 		tiersByName["volcano.sh/hypercluster"][2] == 1 &&
 		tiersByName["volcano.sh/hypercluster"][3] == 1 &&
 		tiersByName["volcano.sh/superpod"][1] == 2, nil
+}
+
+func mixedTopologyJobUsesProfiles(testCtx *e2eutil.TestContext, job *batchv1alpha1.Job) (bool, bool, error) {
+	hasA3 := false
+	hasA5 := false
+	for _, pod := range e2eutil.GetTasksOfJob(testCtx, job) {
+		if pod.Spec.NodeName == "" {
+			return false, false, fmt.Errorf("pod %s/%s is not scheduled", pod.Namespace, pod.Name)
+		}
+		node, err := testCtx.Kubeclient.CoreV1().Nodes().Get(context.Background(), pod.Spec.NodeName, metav1.GetOptions{})
+		if err != nil {
+			return false, false, err
+		}
+		switch node.Labels[mixedProfileLabel] {
+		case "a3":
+			hasA3 = true
+		case "a5":
+			hasA5 = true
+		default:
+			return false, false, fmt.Errorf("pod %s/%s scheduled to node %s without a mixed topology profile", pod.Namespace, pod.Name, pod.Spec.NodeName)
+		}
+	}
+	return hasA3, hasA5, nil
 }
 
 func mixedTopologyDiscoveryConfig() string {
