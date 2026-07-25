@@ -126,6 +126,74 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		}, 60*time.Second, time.Second).Should(BeTrue())
 	})
 
+	It("selects feasible hard topology trees without crossing semantic boundaries", func() {
+		controllerConfigMap, err := findControllerConfigMap(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		originalControllerConfig := controllerConfigMap.Data["volcano-controller.conf"]
+
+		originalNodes, err := labelMixedTopologyNodes(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		defer func() {
+			Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, originalControllerConfig)).To(Succeed())
+			Expect(restoreNodeLabels(testCtx.Kubeclient, originalNodes)).To(Succeed())
+		}()
+
+		By("enabling A3 and A5 label discovery profiles")
+		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, mixedTopologyDiscoveryConfig())).To(Succeed())
+		Eventually(func() (bool, error) {
+			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
+		}, 60*time.Second, time.Second).Should(BeTrue())
+
+		By("selecting A3 when A5 is the only resource-infeasible tree")
+		a5Blockers := createMixedTopologyBlockers(testCtx, "mixed-a5-blocker", []int{4, 5, 6, 7})
+		a3OnlyJob := createMixedTopologyHardJob(testCtx, "mixed-hard-a3-only", "volcano.sh/hypercluster", 4)
+		Expect(e2eutil.WaitJobReady(testCtx, a3OnlyJob)).NotTo(HaveOccurred())
+		Expect(e2eutil.VerifyPodScheduling(testCtx, a3OnlyJob,
+			[]string{"kwok-node-0", "kwok-node-1", "kwok-node-2", "kwok-node-3"})).NotTo(HaveOccurred())
+		e2eutil.DeleteJob(testCtx, a3OnlyJob)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, a3OnlyJob)).NotTo(HaveOccurred())
+		deleteMixedTopologyBlockers(testCtx, a5Blockers)
+
+		By("selecting A5 when only its semantic hypernode domain can contain the gang")
+		a5OnlyJob := createMixedTopologyHardJob(testCtx, "mixed-hard-a5-only", "volcano.sh/hypernode", 4)
+		Expect(e2eutil.WaitJobReady(testCtx, a5OnlyJob)).NotTo(HaveOccurred())
+		Expect(e2eutil.VerifyPodScheduling(testCtx, a5OnlyJob,
+			[]string{"kwok-node-4", "kwok-node-5", "kwok-node-6", "kwok-node-7"})).NotTo(HaveOccurred())
+		e2eutil.DeleteJob(testCtx, a5OnlyJob)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, a5OnlyJob)).NotTo(HaveOccurred())
+
+		By("keeping a hard gang in one real tree when both trees are feasible")
+		bothFeasibleJob := createMixedTopologyHardJob(testCtx, "mixed-hard-both-feasible", "volcano.sh/hypercluster", 4)
+		Expect(e2eutil.WaitJobReady(testCtx, bothFeasibleJob)).NotTo(HaveOccurred())
+		hasA3, hasA5, err := mixedTopologyJobUsesProfiles(testCtx, bothFeasibleJob)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasA3 != hasA5).To(BeTrue(), "a hard gang must select exactly one feasible real tree")
+		e2eutil.DeleteJob(testCtx, bothFeasibleJob)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, bothFeasibleJob)).NotTo(HaveOccurred())
+
+		By("excluding A3 when the requested semantic tier exists only in A5")
+		a5TierOnlyJob := createMixedTopologyHardJob(testCtx, "mixed-hard-a5-tier-only", "volcano.sh/superpod", 2)
+		Expect(e2eutil.WaitJobReady(testCtx, a5TierOnlyJob)).NotTo(HaveOccurred())
+		Expect(e2eutil.VerifyPodScheduling(testCtx, a5TierOnlyJob,
+			[]string{"kwok-node-4", "kwok-node-5", "kwok-node-6", "kwok-node-7"})).NotTo(HaveOccurred())
+		domains, err := mixedTopologyJobDomains(testCtx, a5TierOnlyJob, mixedA5SuperPodLabel)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(domains).To(HaveLen(1), "the hard gang must fit within one A5 superpod")
+		e2eutil.DeleteJob(testCtx, a5TierOnlyJob)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, a5TierOnlyJob)).NotTo(HaveOccurred())
+
+		By("keeping the complete hard gang pending when neither tree is feasible")
+		allBlockers := createMixedTopologyBlockers(testCtx, "mixed-all-blocker", []int{0, 1, 2, 3, 4, 5, 6, 7})
+		defer deleteMixedTopologyBlockers(testCtx, allBlockers)
+		neitherFeasibleJob := createMixedTopologyHardJob(testCtx, "mixed-hard-neither-feasible", "volcano.sh/hypercluster", 4)
+		defer e2eutil.DeleteJob(testCtx, neitherFeasibleJob)
+		Expect(e2eutil.WaitTaskPhase(testCtx, neitherFeasibleJob, []v1.PodPhase{v1.PodPending}, 4)).NotTo(HaveOccurred())
+		Consistently(func() (bool, error) {
+			return mixedTopologyJobPodsUnbound(testCtx, neitherFeasibleJob, 4)
+		}, 10*time.Second, 250*time.Millisecond).Should(BeTrue(),
+			"an infeasible hard gang must not partially bind or cross A3 and A5")
+	})
+
 	It("keeps hard subgroups in their semantic domains across pod and scheduler restarts", func() {
 		controllerConfigMap, err := findControllerConfigMap(testCtx.Kubeclient)
 		Expect(err).NotTo(HaveOccurred())
@@ -541,6 +609,100 @@ func mixedTopologyJobUsesProfiles(testCtx *e2eutil.TestContext, job *batchv1alph
 		}
 	}
 	return hasA3, hasA5, nil
+}
+
+func createMixedTopologyHardJob(
+	testCtx *e2eutil.TestContext,
+	name, highestTierName string,
+	replicas int32,
+) *batchv1alpha1.Job {
+	return e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
+		Name: name,
+		NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+			Mode:            batchv1alpha1.HardNetworkTopologyMode,
+			HighestTierName: highestTierName,
+		},
+		Tasks: []e2eutil.TaskSpec{{
+			Name:        "worker",
+			Img:         e2eutil.DefaultNginxImage,
+			Req:         e2eutil.CPU5Mem5,
+			Min:         replicas,
+			Rep:         replicas,
+			Tolerations: mixedTopologyTolerations,
+		}},
+	})
+}
+
+func createMixedTopologyBlockers(testCtx *e2eutil.TestContext, prefix string, nodeIndexes []int) []*v1.Pod {
+	pods := make([]*v1.Pod, 0, len(nodeIndexes))
+	for _, nodeIndex := range nodeIndexes {
+		pod := e2eutil.CreatePod(testCtx, e2eutil.PodSpec{
+			Name:        fmt.Sprintf("%s-%d", prefix, nodeIndex),
+			Node:        fmt.Sprintf("kwok-node-%d", nodeIndex),
+			Req:         e2eutil.CPU4Mem4,
+			Tolerations: mixedTopologyTolerations,
+		})
+		Expect(e2eutil.WaitPodReady(testCtx, pod)).NotTo(HaveOccurred())
+		pods = append(pods, pod)
+	}
+	return pods
+}
+
+func deleteMixedTopologyBlockers(testCtx *e2eutil.TestContext, pods []*v1.Pod) {
+	for _, pod := range pods {
+		e2eutil.DeletePod(testCtx, pod)
+	}
+	for _, pod := range pods {
+		Expect(e2eutil.WaitPodGone(testCtx, pod.Name, pod.Namespace)).NotTo(HaveOccurred())
+	}
+}
+
+func mixedTopologyJobDomains(
+	testCtx *e2eutil.TestContext,
+	job *batchv1alpha1.Job,
+	domainLabel string,
+) (sets.Set[string], error) {
+	domains := sets.New[string]()
+	for _, pod := range e2eutil.GetTasksOfJob(testCtx, job) {
+		if pod.Spec.NodeName == "" {
+			return nil, fmt.Errorf("pod %s/%s is not scheduled", pod.Namespace, pod.Name)
+		}
+		node, err := testCtx.Kubeclient.CoreV1().Nodes().Get(
+			context.Background(), pod.Spec.NodeName, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		domain := node.Labels[domainLabel]
+		if domain == "" {
+			return nil, fmt.Errorf("node %s has no topology domain label %s", node.Name, domainLabel)
+		}
+		domains.Insert(domain)
+	}
+	return domains, nil
+}
+
+func mixedTopologyJobPodsUnbound(
+	testCtx *e2eutil.TestContext,
+	job *batchv1alpha1.Job,
+	expectedPods int,
+) (bool, error) {
+	pods, err := testCtx.Kubeclient.CoreV1().Pods(job.Namespace).List(
+		context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return false, err
+	}
+	controlledPods := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, job) {
+			continue
+		}
+		controlledPods++
+		if pod.Spec.NodeName != "" || pod.Status.Phase != v1.PodPending {
+			return false, nil
+		}
+	}
+	return controlledPods == expectedPods, nil
 }
 
 func mixedTopologySubGroupProfiles(
