@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 
@@ -125,7 +126,7 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		}, 60*time.Second, time.Second).Should(BeTrue())
 	})
 
-	It("keeps hard subgroups in the selected semantic tree after a pod is replaced", func() {
+	It("keeps hard subgroups in their semantic domains across pod and scheduler restarts", func() {
 		controllerConfigMap, err := findControllerConfigMap(testCtx.Kubeclient)
 		Expect(err).NotTo(HaveOccurred())
 		originalControllerConfig := controllerConfigMap.Data["volcano-controller.conf"]
@@ -176,39 +177,26 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		Expect(sets.New(domainsBefore["0"], domainsBefore["1"])).To(HaveLen(2),
 			"the two CPU-saturated subgroups must occupy different A5 superpods")
 
-		var victim *v1.Pod
-		for _, pod := range e2eutil.GetTasksOfJob(testCtx, job) {
-			if pod.Labels[batchv1alpha1.TaskPartitionID] == "0" {
-				victim = pod
-				break
-			}
-		}
-		Expect(victim).NotTo(BeNil())
-		victimUID := victim.UID
-
 		By("deleting one subgroup pod and waiting for a different pod instance")
-		e2eutil.DeletePod(testCtx, victim)
-		Eventually(func() (bool, error) {
-			pods, err := testCtx.Kubeclient.CoreV1().Pods(job.Namespace).List(
-				context.Background(), metav1.ListOptions{})
-			if err != nil {
-				return false, err
-			}
-			for i := range pods.Items {
-				pod := &pods.Items[i]
-				if metav1.IsControlledBy(pod, job) && pod.UID == victimUID {
-					return false, nil
-				}
-			}
-			return true, nil
-		}, 60*time.Second, 250*time.Millisecond).Should(BeTrue())
-		Expect(e2eutil.WaitTaskPhase(testCtx, job, []v1.PodPhase{v1.PodRunning}, 4)).NotTo(HaveOccurred())
+		Expect(replaceMixedTopologyJobPod(testCtx, job, "0", 4)).To(Succeed())
 		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
 
 		By("verifying the replacement remains in the original subgroup superpod")
 		domainsAfter, err := mixedTopologySubGroupDomains(testCtx, job, "a5", mixedA5SuperPodLabel, 2, 2)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(domainsAfter).To(Equal(domainsBefore))
+
+		By("restarting every Volcano Scheduler process and waiting for new ready instances")
+		Expect(restartVolcanoScheduler(testCtx.Kubeclient)).To(Succeed())
+
+		By("replacing a pod after the scheduler has lost its in-memory allocation state")
+		Expect(replaceMixedTopologyJobPod(testCtx, job, "1", 4)).To(Succeed())
+		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
+
+		By("verifying scheduler recovery keeps every subgroup in its original superpod")
+		domainsAfterRestart, err := mixedTopologySubGroupDomains(testCtx, job, "a5", mixedA5SuperPodLabel, 2, 2)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(domainsAfterRestart).To(Equal(domainsBefore))
 	})
 
 	It("keeps soft jobs in one tree when possible and uses the virtual root as fallback", func() {
@@ -552,6 +540,147 @@ func mixedTopologySubGroupDomains(
 		return nil, fmt.Errorf("found unexpected partitions: %v", sets.KeySet(domainsByPartition).UnsortedList())
 	}
 	return result, nil
+}
+
+func replaceMixedTopologyJobPod(
+	testCtx *e2eutil.TestContext,
+	job *batchv1alpha1.Job,
+	partition string,
+	expectedPods int,
+) error {
+	pods, err := testCtx.Kubeclient.CoreV1().Pods(job.Namespace).List(
+		context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	initialUIDs := sets.New[string]()
+	var victim *v1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, job) {
+			continue
+		}
+		initialUIDs.Insert(string(pod.UID))
+		if victim == nil && pod.Labels[batchv1alpha1.TaskPartitionID] == partition {
+			victim = pod.DeepCopy()
+		}
+	}
+	if victim == nil {
+		return fmt.Errorf("job %s has no pod in partition %s", job.Name, partition)
+	}
+	if len(initialUIDs) != expectedPods {
+		return fmt.Errorf("job %s has %d pods before replacement, expected %d",
+			job.Name, len(initialUIDs), expectedPods)
+	}
+	if err := testCtx.Kubeclient.CoreV1().Pods(victim.Namespace).Delete(
+		context.Background(), victim.Name, metav1.DeleteOptions{}); err != nil {
+		return err
+	}
+
+	lastState := "replacement not observed"
+	err = wait.PollUntilContextTimeout(context.Background(), 250*time.Millisecond, 2*time.Minute, true,
+		func(ctx context.Context) (bool, error) {
+			currentPods, err := testCtx.Kubeclient.CoreV1().Pods(job.Namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return false, err
+			}
+
+			controlledPods := 0
+			readyPods := 0
+			replacementFound := false
+			victimStillExists := false
+			for i := range currentPods.Items {
+				pod := &currentPods.Items[i]
+				if !metav1.IsControlledBy(pod, job) {
+					continue
+				}
+				controlledPods++
+				if pod.UID == victim.UID {
+					victimStillExists = true
+				}
+				if !initialUIDs.Has(string(pod.UID)) {
+					replacementFound = true
+				}
+				if pod.Status.Phase == v1.PodRunning && mixedTopologyPodReady(pod) {
+					readyPods++
+				}
+			}
+			lastState = fmt.Sprintf("controlled=%d ready=%d replacement=%t victimPresent=%t",
+				controlledPods, readyPods, replacementFound, victimStillExists)
+			return controlledPods == expectedPods && readyPods == expectedPods &&
+				replacementFound && !victimStillExists, nil
+		})
+	if err != nil {
+		return fmt.Errorf("wait for replacement of pod %s/%s: %w (%s)",
+			victim.Namespace, victim.Name, err, lastState)
+	}
+	return nil
+}
+
+func restartVolcanoScheduler(client kubernetes.Interface) error {
+	const schedulerSelector = "app=volcano-scheduler"
+
+	pods, err := client.CoreV1().Pods(v1.NamespaceAll).List(
+		context.Background(), metav1.ListOptions{LabelSelector: schedulerSelector})
+	if err != nil {
+		return err
+	}
+	if len(pods.Items) == 0 {
+		return fmt.Errorf("no Volcano Scheduler pods found")
+	}
+
+	oldUIDs := sets.New[string]()
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !mixedTopologyPodReady(pod) {
+			return fmt.Errorf("Volcano Scheduler pod %s/%s is not ready before restart", pod.Namespace, pod.Name)
+		}
+		oldUIDs.Insert(string(pod.UID))
+		if err := client.CoreV1().Pods(pod.Namespace).Delete(
+			context.Background(), pod.Name, metav1.DeleteOptions{}); err != nil {
+			return err
+		}
+	}
+
+	lastState := "new scheduler pod not observed"
+	err = wait.PollUntilContextTimeout(context.Background(), 500*time.Millisecond, 2*time.Minute, true,
+		func(ctx context.Context) (bool, error) {
+			currentPods, err := client.CoreV1().Pods(v1.NamespaceAll).List(
+				ctx, metav1.ListOptions{LabelSelector: schedulerSelector})
+			if err != nil {
+				return false, err
+			}
+
+			readyNewPods := 0
+			oldPodPresent := false
+			for i := range currentPods.Items {
+				pod := &currentPods.Items[i]
+				if oldUIDs.Has(string(pod.UID)) {
+					oldPodPresent = true
+					continue
+				}
+				if pod.DeletionTimestamp == nil && mixedTopologyPodReady(pod) {
+					readyNewPods++
+				}
+			}
+			lastState = fmt.Sprintf("readyNew=%d expected=%d oldPresent=%t",
+				readyNewPods, len(oldUIDs), oldPodPresent)
+			return readyNewPods >= len(oldUIDs) && !oldPodPresent, nil
+		})
+	if err != nil {
+		return fmt.Errorf("wait for Volcano Scheduler restart: %w (%s)", err, lastState)
+	}
+	return nil
+}
+
+func mixedTopologyPodReady(pod *v1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == v1.PodReady {
+			return condition.Status == v1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func mixedTopologyDiscoveryConfig() string {
