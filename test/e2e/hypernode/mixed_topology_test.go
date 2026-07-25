@@ -262,6 +262,70 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		e2eutil.DeleteJob(testCtx, crossTreeJob)
 		Expect(e2eutil.WaitJobCleanedUp(testCtx, crossTreeJob)).NotTo(HaveOccurred())
 
+		By("keeping soft subgroups inside the real tree selected by a hard job")
+		hardJobSoftSubGroups := e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
+			Name: "mixed-hard-job-soft-subgroups",
+			NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+				Mode:            batchv1alpha1.HardNetworkTopologyMode,
+				HighestTierName: "volcano.sh/hypercluster",
+			},
+			Tasks: []e2eutil.TaskSpec{{
+				Name:        "worker",
+				Img:         e2eutil.DefaultNginxImage,
+				Req:         e2eutil.CPU5Mem5,
+				Min:         4,
+				Rep:         4,
+				Tolerations: mixedTopologyTolerations,
+				PartitionPolicy: &batchv1alpha1.PartitionPolicySpec{
+					TotalPartitions: 2,
+					PartitionSize:   2,
+					MinPartitions:   2,
+					NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+						Mode: batchv1alpha1.SoftNetworkTopologyMode,
+					},
+				},
+			}},
+		})
+		Expect(e2eutil.WaitJobReady(testCtx, hardJobSoftSubGroups)).NotTo(HaveOccurred())
+		hasA3, hasA5, err = mixedTopologyJobUsesProfiles(testCtx, hardJobSoftSubGroups)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasA3 != hasA5).To(BeTrue(), "soft subgroups must not escape the hard job's selected tree")
+		subGroupProfiles, err := mixedTopologySubGroupProfiles(testCtx, hardJobSoftSubGroups, 2, 2)
+		Expect(err).NotTo(HaveOccurred())
+		for partition, profiles := range subGroupProfiles {
+			Expect(profiles).To(HaveLen(1), "soft subgroup %s should stay in one real tree", partition)
+		}
+		e2eutil.DeleteJob(testCtx, hardJobSoftSubGroups)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, hardJobSoftSubGroups)).NotTo(HaveOccurred())
+
+		By("letting a soft subgroup use the virtual root when no real tree can contain it")
+		virtualRootSubGroup := e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
+			Name: "mixed-soft-subgroup-virtual-root",
+			Tasks: []e2eutil.TaskSpec{{
+				Name:        "worker",
+				Img:         e2eutil.DefaultNginxImage,
+				Req:         e2eutil.CPU5Mem5,
+				Min:         8,
+				Rep:         8,
+				Tolerations: mixedTopologyTolerations,
+				PartitionPolicy: &batchv1alpha1.PartitionPolicySpec{
+					TotalPartitions: 1,
+					PartitionSize:   8,
+					MinPartitions:   1,
+					NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+						Mode: batchv1alpha1.SoftNetworkTopologyMode,
+					},
+				},
+			}},
+		})
+		Expect(e2eutil.WaitJobReady(testCtx, virtualRootSubGroup)).NotTo(HaveOccurred())
+		subGroupProfiles, err = mixedTopologySubGroupProfiles(testCtx, virtualRootSubGroup, 1, 8)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(subGroupProfiles["0"]).To(Equal(sets.New("a3", "a5")),
+			"a soft subgroup larger than either real tree must use the virtual root")
+		e2eutil.DeleteJob(testCtx, virtualRootSubGroup)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, virtualRootSubGroup)).NotTo(HaveOccurred())
+
 		By("keeping the entire gang pending when mixed-tree total capacity is insufficient")
 		insufficientJob := e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
 			Name: "mixed-soft-insufficient-job",
@@ -477,6 +541,58 @@ func mixedTopologyJobUsesProfiles(testCtx *e2eutil.TestContext, job *batchv1alph
 		}
 	}
 	return hasA3, hasA5, nil
+}
+
+func mixedTopologySubGroupProfiles(
+	testCtx *e2eutil.TestContext,
+	job *batchv1alpha1.Job,
+	expectedPartitions, expectedPartitionSize int,
+) (map[string]sets.Set[string], error) {
+	pods := e2eutil.GetTasksOfJob(testCtx, job)
+	expectedPods := expectedPartitions * expectedPartitionSize
+	if len(pods) != expectedPods {
+		return nil, fmt.Errorf("expected %d pods for job %s, got %d", expectedPods, job.Name, len(pods))
+	}
+
+	podCounts := make(map[string]int, expectedPartitions)
+	profilesByPartition := make(map[string]sets.Set[string], expectedPartitions)
+	for _, pod := range pods {
+		partition, found := pod.Labels[batchv1alpha1.TaskPartitionID]
+		if !found || partition == "" {
+			return nil, fmt.Errorf("pod %s/%s has no partition label", pod.Namespace, pod.Name)
+		}
+		if pod.Spec.NodeName == "" {
+			return nil, fmt.Errorf("pod %s/%s is not scheduled", pod.Namespace, pod.Name)
+		}
+
+		node, err := testCtx.Kubeclient.CoreV1().Nodes().Get(
+			context.Background(), pod.Spec.NodeName, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		profile := node.Labels[mixedProfileLabel]
+		if profile != "a3" && profile != "a5" {
+			return nil, fmt.Errorf("pod %s/%s is on node %s with unexpected profile %q",
+				pod.Namespace, pod.Name, node.Name, profile)
+		}
+		if profilesByPartition[partition] == nil {
+			profilesByPartition[partition] = sets.New[string]()
+		}
+		profilesByPartition[partition].Insert(profile)
+		podCounts[partition]++
+	}
+
+	for partitionIndex := 0; partitionIndex < expectedPartitions; partitionIndex++ {
+		partition := fmt.Sprint(partitionIndex)
+		if podCounts[partition] != expectedPartitionSize {
+			return nil, fmt.Errorf("partition %s has %d pods, expected %d",
+				partition, podCounts[partition], expectedPartitionSize)
+		}
+	}
+	if len(profilesByPartition) != expectedPartitions {
+		return nil, fmt.Errorf("found unexpected partitions: %v", sets.KeySet(profilesByPartition).UnsortedList())
+	}
+	return profilesByPartition, nil
 }
 
 func mixedTopologySubGroupDomains(
