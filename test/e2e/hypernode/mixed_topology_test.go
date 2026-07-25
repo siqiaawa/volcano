@@ -27,6 +27,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 
@@ -122,6 +123,92 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		Eventually(func() (bool, error) {
 			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
 		}, 60*time.Second, time.Second).Should(BeTrue())
+	})
+
+	It("keeps hard subgroups in the selected semantic tree after a pod is replaced", func() {
+		controllerConfigMap, err := findControllerConfigMap(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		originalControllerConfig := controllerConfigMap.Data["volcano-controller.conf"]
+
+		originalNodes, err := labelMixedTopologyNodes(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		defer func() {
+			Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, originalControllerConfig)).To(Succeed())
+			Expect(restoreNodeLabels(testCtx.Kubeclient, originalNodes)).To(Succeed())
+		}()
+
+		By("enabling A3 and A5 label discovery profiles")
+		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, mixedTopologyDiscoveryConfig())).To(Succeed())
+		Eventually(func() (bool, error) {
+			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
+		}, 60*time.Second, time.Second).Should(BeTrue())
+
+		By("scheduling two hard subgroups on the A5-only superpod tier")
+		job := e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
+			Name: "mixed-hard-subgroup-job",
+			NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+				Mode:            batchv1alpha1.HardNetworkTopologyMode,
+				HighestTierName: "volcano.sh/hypercluster",
+			},
+			Tasks: []e2eutil.TaskSpec{{
+				Name:        "worker",
+				Img:         e2eutil.DefaultNginxImage,
+				Req:         e2eutil.CPU5Mem5,
+				Min:         4,
+				Rep:         4,
+				Tolerations: mixedTopologyTolerations,
+				PartitionPolicy: &batchv1alpha1.PartitionPolicySpec{
+					TotalPartitions: 2,
+					PartitionSize:   2,
+					MinPartitions:   2,
+					NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+						Mode:            batchv1alpha1.HardNetworkTopologyMode,
+						HighestTierName: "volcano.sh/superpod",
+					},
+				},
+			}},
+		})
+		defer e2eutil.DeleteJob(testCtx, job)
+		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
+
+		domainsBefore, err := mixedTopologySubGroupDomains(testCtx, job, "a5", mixedA5SuperPodLabel, 2, 2)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sets.New(domainsBefore["0"], domainsBefore["1"])).To(HaveLen(2),
+			"the two CPU-saturated subgroups must occupy different A5 superpods")
+
+		var victim *v1.Pod
+		for _, pod := range e2eutil.GetTasksOfJob(testCtx, job) {
+			if pod.Labels[batchv1alpha1.TaskPartitionID] == "0" {
+				victim = pod
+				break
+			}
+		}
+		Expect(victim).NotTo(BeNil())
+		victimUID := victim.UID
+
+		By("deleting one subgroup pod and waiting for a different pod instance")
+		e2eutil.DeletePod(testCtx, victim)
+		Eventually(func() (bool, error) {
+			pods, err := testCtx.Kubeclient.CoreV1().Pods(job.Namespace).List(
+				context.Background(), metav1.ListOptions{})
+			if err != nil {
+				return false, err
+			}
+			for i := range pods.Items {
+				pod := &pods.Items[i]
+				if metav1.IsControlledBy(pod, job) && pod.UID == victimUID {
+					return false, nil
+				}
+			}
+			return true, nil
+		}, 60*time.Second, 250*time.Millisecond).Should(BeTrue())
+		Expect(e2eutil.WaitTaskPhase(testCtx, job, []v1.PodPhase{v1.PodRunning}, 4)).NotTo(HaveOccurred())
+		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
+
+		By("verifying the replacement remains in the original subgroup superpod")
+		domainsAfter, err := mixedTopologySubGroupDomains(testCtx, job, "a5", mixedA5SuperPodLabel, 2, 2)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(domainsAfter).To(Equal(domainsBefore))
 	})
 
 	It("keeps soft jobs in one tree when possible and uses the virtual root as fallback", func() {
@@ -402,6 +489,69 @@ func mixedTopologyJobUsesProfiles(testCtx *e2eutil.TestContext, job *batchv1alph
 		}
 	}
 	return hasA3, hasA5, nil
+}
+
+func mixedTopologySubGroupDomains(
+	testCtx *e2eutil.TestContext,
+	job *batchv1alpha1.Job,
+	expectedProfile, domainLabel string,
+	expectedPartitions, expectedPartitionSize int,
+) (map[string]string, error) {
+	pods := e2eutil.GetTasksOfJob(testCtx, job)
+	expectedPods := expectedPartitions * expectedPartitionSize
+	if len(pods) != expectedPods {
+		return nil, fmt.Errorf("expected %d pods for job %s, got %d", expectedPods, job.Name, len(pods))
+	}
+
+	podCounts := make(map[string]int, expectedPartitions)
+	domainsByPartition := make(map[string]sets.Set[string], expectedPartitions)
+	for _, pod := range pods {
+		partition, found := pod.Labels[batchv1alpha1.TaskPartitionID]
+		if !found || partition == "" {
+			return nil, fmt.Errorf("pod %s/%s has no partition label", pod.Namespace, pod.Name)
+		}
+		if pod.Spec.NodeName == "" {
+			return nil, fmt.Errorf("pod %s/%s is not scheduled", pod.Namespace, pod.Name)
+		}
+
+		node, err := testCtx.Kubeclient.CoreV1().Nodes().Get(
+			context.Background(), pod.Spec.NodeName, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if profile := node.Labels[mixedProfileLabel]; profile != expectedProfile {
+			return nil, fmt.Errorf("pod %s/%s is on profile %q, expected %q",
+				pod.Namespace, pod.Name, profile, expectedProfile)
+		}
+		domain := node.Labels[domainLabel]
+		if domain == "" {
+			return nil, fmt.Errorf("node %s has no topology domain label %s", node.Name, domainLabel)
+		}
+
+		if domainsByPartition[partition] == nil {
+			domainsByPartition[partition] = sets.New[string]()
+		}
+		domainsByPartition[partition].Insert(domain)
+		podCounts[partition]++
+	}
+
+	result := make(map[string]string, expectedPartitions)
+	for partitionIndex := 0; partitionIndex < expectedPartitions; partitionIndex++ {
+		partition := fmt.Sprint(partitionIndex)
+		if podCounts[partition] != expectedPartitionSize {
+			return nil, fmt.Errorf("partition %s has %d pods, expected %d",
+				partition, podCounts[partition], expectedPartitionSize)
+		}
+		domains := domainsByPartition[partition]
+		if domains.Len() != 1 {
+			return nil, fmt.Errorf("partition %s spans topology domains %v", partition, domains.UnsortedList())
+		}
+		result[partition] = domains.UnsortedList()[0]
+	}
+	if len(domainsByPartition) != expectedPartitions {
+		return nil, fmt.Errorf("found unexpected partitions: %v", sets.KeySet(domainsByPartition).UnsortedList())
+	}
+	return result, nil
 }
 
 func mixedTopologyDiscoveryConfig() string {

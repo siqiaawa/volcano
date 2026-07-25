@@ -5,10 +5,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 
+	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	"volcano.sh/apis/pkg/apis/scheduling"
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
@@ -54,6 +59,122 @@ func TestSessionEnsureTopologyTrees(t *testing.T) {
 	assert.Equal(t, "a5-root", ssn.HyperNodeToTopologyTree["a5-middle"])
 	_, clusterRootIndexed := ssn.HyperNodeToTopologyTree[ClusterTopHyperNode]
 	assert.False(t, clusterRootIndexed)
+}
+
+func TestSessionRecoverAllocatedHyperNodeAcrossMixedTopology(t *testing.T) {
+	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
+		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+		info.Children.Insert(children...)
+		return info
+	}
+
+	hyperNodes := api.HyperNodeInfoMap{
+		"a3-hypernode-0": newHyperNode("a3-hypernode-0", 1),
+		"a3-hypernode-1": newHyperNode("a3-hypernode-1", 1),
+		"a3-hypercluster": newHyperNode(
+			"a3-hypercluster", 2, "a3-hypernode-0", "a3-hypernode-1"),
+		"a5-superpod-0": newHyperNode("a5-superpod-0", 1),
+		"a5-superpod-1": newHyperNode("a5-superpod-1", 1),
+		"a5-hypernode": newHyperNode(
+			"a5-hypernode", 2, "a5-superpod-0", "a5-superpod-1"),
+		"a5-hypercluster": newHyperNode("a5-hypercluster", 3, "a5-hypernode"),
+		ClusterTopHyperNode: newHyperNode(
+			ClusterTopHyperNode, 4, "a3-hypercluster", "a5-hypercluster"),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+
+	realNodes := map[string]sets.Set[string]{
+		"a3-hypernode-0": sets.New("a3-node-0", "a3-node-1"),
+		"a3-hypernode-1": sets.New("a3-node-2", "a3-node-3"),
+		"a3-hypercluster": sets.New(
+			"a3-node-0", "a3-node-1", "a3-node-2", "a3-node-3"),
+		"a5-superpod-0": sets.New("a5-node-0", "a5-node-1"),
+		"a5-superpod-1": sets.New("a5-node-2", "a5-node-3"),
+		"a5-hypernode": sets.New(
+			"a5-node-0", "a5-node-1", "a5-node-2", "a5-node-3"),
+		"a5-hypercluster": sets.New(
+			"a5-node-0", "a5-node-1", "a5-node-2", "a5-node-3"),
+		ClusterTopHyperNode: sets.New(
+			"a3-node-0", "a3-node-1", "a3-node-2", "a3-node-3",
+			"a5-node-0", "a5-node-1", "a5-node-2", "a5-node-3"),
+	}
+
+	const (
+		namespace    = "test"
+		podGroupName = "mixed-recovery"
+		taskName     = "worker"
+	)
+	jobID := api.JobID(namespace + "/" + podGroupName)
+	subGroupSize := int32(2)
+	minSubGroups := int32(2)
+	job := api.NewJobInfo(jobID)
+	job.SetPodGroup(&api.PodGroup{PodGroup: scheduling.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: podGroupName, Namespace: namespace},
+		Spec: scheduling.PodGroupSpec{
+			MinMember: 4,
+			NetworkTopology: &scheduling.NetworkTopologySpec{
+				Mode:            scheduling.HardNetworkTopologyMode,
+				HighestTierName: "volcano.sh/hypercluster",
+			},
+			SubGroupPolicy: []scheduling.SubGroupPolicySpec{{
+				Name:         taskName,
+				SubGroupSize: &subGroupSize,
+				MinSubGroups: &minSubGroups,
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					batchv1alpha1.TaskSpecKey: taskName,
+				}},
+				MatchLabelKeys: []string{batchv1alpha1.TaskPartitionID},
+				NetworkTopology: &scheduling.NetworkTopologySpec{
+					Mode:            scheduling.HardNetworkTopologyMode,
+					HighestTierName: "volcano.sh/superpod",
+				},
+			}},
+		},
+	}})
+
+	for partition, nodes := range [][]string{
+		{"a5-node-0", "a5-node-1"},
+		{"a5-node-2", "a5-node-3"},
+	} {
+		for index, nodeName := range nodes {
+			podName := fmt.Sprintf("worker-%d-%d", partition, index)
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      podName,
+					Namespace: namespace,
+					UID:       types.UID(podName),
+					Labels: map[string]string{
+						batchv1alpha1.TaskSpecKey:     taskName,
+						batchv1alpha1.TaskPartitionID: fmt.Sprint(partition),
+					},
+					Annotations: map[string]string{
+						schedulingv1beta1.KubeGroupNameAnnotationKey: podGroupName,
+					},
+				},
+				Spec:   v1.PodSpec{NodeName: nodeName},
+				Status: v1.PodStatus{Phase: v1.PodRunning},
+			}
+			job.AddTaskInfo(api.NewTaskInfo(pod))
+		}
+	}
+
+	ssn := &Session{DirtyJobs: sets.New[api.JobID]()}
+	ssn.recoverAllocatedHyperNode(job, sets.KeySet(hyperNodes), hyperNodes, realNodes)
+
+	assert.Equal(t, "a5-hypernode", job.AllocatedHyperNode)
+	assert.Len(t, job.SubJobs, 2)
+	expectedSubGroupHyperNodes := map[int]string{
+		0: "a5-superpod-0",
+		1: "a5-superpod-1",
+	}
+	for _, subJob := range job.SubJobs {
+		assert.Equal(t, expectedSubGroupHyperNodes[subJob.MatchIndex], subJob.AllocatedHyperNode)
+	}
+	assert.True(t, ssn.DirtyJobs.Has(jobID))
 }
 
 func TestSession_adjustNetworkTopologySpec(t *testing.T) {
