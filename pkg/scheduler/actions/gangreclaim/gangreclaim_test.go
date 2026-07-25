@@ -23,14 +23,49 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	schedulingapi "volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
+	"volcano.sh/volcano/cmd/scheduler/app/options"
 	"volcano.sh/volcano/pkg/scheduler/actions/utils"
 	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/cache"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 )
+
+const mixedDomainReclaimPluginName = "mixed-domain-gangreclaim-test"
+
+type mixedDomainReclaimPlugin struct {
+	domains        [2]string
+	rejectedDomain string
+	visitedDomains []string
+	jobPurposes    []api.SearchPurpose
+	subJobPurposes []api.SearchPurpose
+}
+
+func (p *mixedDomainReclaimPlugin) Name() string { return mixedDomainReclaimPluginName }
+
+func (p *mixedDomainReclaimPlugin) OnSessionOpen(ssn *framework.Session) {
+	ssn.AddHyperNodeGradientForJobFn(p.Name(), func(_ *api.JobInfo, _ *api.HyperNodeInfo, purpose api.SearchPurpose) [][]*api.HyperNodeInfo {
+		p.jobPurposes = append(p.jobPurposes, purpose)
+		return [][]*api.HyperNodeInfo{{ssn.HyperNodes[p.domains[0]]}, {ssn.HyperNodes[p.domains[1]]}}
+	})
+	ssn.AddHyperNodeGradientForSubJobFn(p.Name(), func(_ *api.SubJobInfo, domain *api.HyperNodeInfo, purpose api.SearchPurpose) [][]*api.HyperNodeInfo {
+		p.subJobPurposes = append(p.subJobPurposes, purpose)
+		return [][]*api.HyperNodeInfo{{domain}}
+	})
+	ssn.AddUnifiedEvictableFn(p.Name(), func(ctx *api.EvictionContext, candidates []*api.TaskInfo) ([]*api.TaskInfo, int) {
+		p.visitedDomains = append(p.visitedDomains, ctx.HyperNode)
+		if ctx.HyperNode == p.rejectedDomain {
+			return nil, 1
+		}
+		return candidates, 1
+	})
+}
+
+func (p *mixedDomainReclaimPlugin) OnSessionClose(*framework.Session) {}
 
 func TestPickDomainsFromGradients_MaxDomainsAndDedup(t *testing.T) {
 	gradients := [][]*api.HyperNodeInfo{
@@ -283,6 +318,114 @@ func TestSelectDomainVictims_AllowVictimJobWhenPreemptableUnset(t *testing.T) {
 	victims := utils.FlattenBundles(action.selectDomainBundles(ssn, nil, reclaimerJob, pending, jobNeed, "d1"))
 	assert.Len(t, victims, 1)
 	assert.Equal(t, api.TaskID(victim.UID), victims[0].UID)
+}
+
+func TestReclaimJobInDomains_MixedTopologyContinuesToSecondTree(t *testing.T) {
+	if options.ServerOpts == nil {
+		options.ServerOpts = options.NewServerOption()
+	}
+	if options.ServerOpts.MinNodesToFind <= 0 {
+		options.ServerOpts.MinNodesToFind = 1
+	}
+
+	const (
+		a3Domain = "a3-hypercluster"
+		a5Domain = "a5-hypercluster"
+		a3Node   = "a3-node"
+		a5Node   = "a5-node"
+	)
+	plugin := &mixedDomainReclaimPlugin{
+		domains:        [2]string{a3Domain, a5Domain},
+		rejectedDomain: a3Domain,
+	}
+	framework.RegisterPluginBuilder(plugin.Name(), func(framework.Arguments) framework.Plugin { return plugin })
+	enabled := true
+	schedulerCache := &cache.SchedulerCache{
+		Nodes:             map[string]*api.NodeInfo{},
+		Jobs:              map[api.JobID]*api.JobInfo{},
+		Queues:            map[api.QueueID]*api.QueueInfo{},
+		HyperNodesInfo:    api.NewHyperNodesInfo(nil),
+		InUseNodesInShard: sets.Set[string]{},
+	}
+	ssn := framework.OpenSession(schedulerCache, []conf.Tier{{Plugins: []conf.PluginOption{{
+		Name:                     plugin.Name(),
+		EnabledHyperNodeGradient: &enabled,
+	}}}}, nil)
+
+	reclaimerJobID := api.JobID("ns/reclaimer-mixed")
+	reclaimer := testTask(reclaimerJobID, "reclaimer-mixed", "", api.Pending, 100, 1000)
+	highestTier := 3
+	reclaimerJob := api.NewJobInfo(reclaimerJobID)
+	reclaimerJob.Queue = "q1"
+	reclaimerJob.MinAvailable = 1
+	reclaimerJob.NetworkTopology = &schedulingapi.NetworkTopologySpec{
+		Mode:               schedulingapi.HardNetworkTopologyMode,
+		HighestTierAllowed: &highestTier,
+	}
+	reclaimerJob.AddTaskInfo(reclaimer)
+
+	victimJobID := api.JobID("ns/reclaim-victim-mixed")
+	a3Victim := testTask(victimJobID, "a3-victim", a3Node, api.Running, 10, 1000)
+	a5Victim := testTask(victimJobID, "a5-victim", a5Node, api.Running, 10, 1000)
+	victimJob := api.NewJobInfo(victimJobID, a3Victim, a5Victim)
+	victimJob.Queue = "q2"
+	victimJob.Preemptable = true
+
+	newOccupiedNode := func(name string, victim *api.TaskInfo) *api.NodeInfo {
+		node := api.NewNodeInfo(&v1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})
+		node.Idle = (&api.Resource{MilliCPU: 1000}).Clone()
+		node.Allocatable = (&api.Resource{MilliCPU: 1000}).Clone()
+		node.Capacity = (&api.Resource{MilliCPU: 1000}).Clone()
+		assert.NoError(t, node.AddTask(victim))
+		return node
+	}
+	a3 := newOccupiedNode(a3Node, a3Victim)
+	a5 := newOccupiedNode(a5Node, a5Victim)
+	reclaimable := true
+	root := framework.ClusterTopHyperNode
+	ssn.Jobs = map[api.JobID]*api.JobInfo{reclaimerJobID: reclaimerJob, victimJobID: victimJob}
+	ssn.Queues = map[api.QueueID]*api.QueueInfo{
+		"q1": {UID: "q1", Name: "q1"},
+		"q2": {
+			UID:   "q2",
+			Name:  "q2",
+			Queue: &schedulingapi.Queue{Spec: schedulingapi.QueueSpec{Reclaimable: &reclaimable}},
+		},
+	}
+	ssn.Nodes = map[string]*api.NodeInfo{a3Node: a3, a5Node: a5}
+	ssn.NodeList = []*api.NodeInfo{a3, a5}
+	ssn.NodesInShard = sets.New[string](a3Node, a5Node)
+	ssn.HyperNodes = api.HyperNodeInfoMap{
+		a3Domain: {Name: a3Domain},
+		a5Domain: {Name: a5Domain},
+		root:     {Name: root},
+	}
+	ssn.RealNodesList = map[string][]*api.NodeInfo{
+		a3Domain: {a3},
+		a5Domain: {a5},
+		root:     {a3, a5},
+	}
+
+	action := New()
+	action.maxDomains = 16
+	stmt := framework.NewStatement(ssn)
+	nominations := action.reclaimJobInDomains(ssn, stmt, ssn.Queues["q1"], reclaimerJob)
+
+	assert.Equal(t, []api.SearchPurpose{api.PurposeEvict}, plugin.jobPurposes)
+	assert.Equal(t, []api.SearchPurpose{api.PurposeEvict}, plugin.subJobPurposes)
+	assert.Equal(t, []string{a3Domain, a5Domain}, plugin.visitedDomains)
+	assert.Len(t, nominations, 1)
+	for _, domain := range nominations {
+		assert.Equal(t, a5Domain, domain)
+	}
+	assert.Equal(t, api.Running, victimJob.Tasks[a3Victim.UID].Status)
+	assert.Equal(t, api.Releasing, victimJob.Tasks[a5Victim.UID].Status)
+	assert.Equal(t, api.Pipelined, reclaimerJob.Tasks[reclaimer.UID].Status)
+	assert.Equal(t, a5Node, reclaimerJob.Tasks[reclaimer.UID].NodeName)
+	_, placedOnA3 := a3.Tasks[api.PodKey(reclaimer.Pod)]
+	_, placedOnA5 := a5.Tasks[api.PodKey(reclaimer.Pod)]
+	assert.False(t, placedOnA3)
+	assert.True(t, placedOnA5)
 }
 
 func testTask(jobID api.JobID, name, node string, status api.TaskStatus, priority int32, milliCPU float64) *api.TaskInfo {

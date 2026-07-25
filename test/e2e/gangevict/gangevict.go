@@ -77,6 +77,13 @@ tiers:
   - name: nodeorder
   - name: binpack
   - name: network-topology-aware
+configurations:
+- name: gangpreempt
+  arguments:
+    maxDomains: 16
+- name: gangreclaim
+  arguments:
+    maxDomains: 16
 `
 
 // applySchedulerConfig returns a ChangeBy-compatible function that
@@ -271,6 +278,13 @@ var kwokTolerations = []v1.Toleration{
 	},
 }
 
+const mixedHyperClusterTierName = "volcano.sh/hypercluster"
+
+var mixedTopologyTreeNodes = map[string][]string{
+	"a3": {"kwok-node-0", "kwok-node-1"},
+	"a5": {"kwok-node-2", "kwok-node-3"},
+}
+
 // tier1Domains maps each tier-1 HyperNode suffix to its leaf KWOK nodes.
 var tier1Domains = map[string][]string{
 	"s0": {"kwok-node-0", "kwok-node-1"},
@@ -332,6 +346,141 @@ func setupTopoHyperNodes(ctx *e2eutil.TestContext, prefix string) {
 			return err
 		}, 30*time.Second, time.Second).Should(BeNil())
 	}
+}
+
+// setupMixedTopoHyperNodes creates two independent topology trees over the
+// four KWOK nodes. The semantic hypercluster boundary is tier 2 in A3 and
+// tier 3 in A5.
+func setupMixedTopoHyperNodes(ctx *e2eutil.TestContext, prefix string) {
+	type hyperNodeSpec struct {
+		name       string
+		tier       int
+		tierName   string
+		memberType topologyv1alpha1.MemberType
+		members    []string
+	}
+
+	a3Leaf := prefix + "-a3-hypernode"
+	a3Root := prefix + "-a3-hypercluster"
+	a5Leaf := prefix + "-a5-superpod"
+	a5Middle := prefix + "-a5-hypernode"
+	a5Root := prefix + "-a5-hypercluster"
+	hyperNodes := []hyperNodeSpec{
+		{
+			name:       a3Leaf,
+			tier:       1,
+			tierName:   "volcano.sh/hypernode",
+			memberType: topologyv1alpha1.MemberTypeNode,
+			members:    mixedTopologyTreeNodes["a3"],
+		},
+		{
+			name:       a3Root,
+			tier:       2,
+			tierName:   mixedHyperClusterTierName,
+			memberType: topologyv1alpha1.MemberTypeHyperNode,
+			members:    []string{a3Leaf},
+		},
+		{
+			name:       a5Leaf,
+			tier:       1,
+			tierName:   "volcano.sh/superpod",
+			memberType: topologyv1alpha1.MemberTypeNode,
+			members:    mixedTopologyTreeNodes["a5"],
+		},
+		{
+			name:       a5Middle,
+			tier:       2,
+			tierName:   "volcano.sh/hypernode",
+			memberType: topologyv1alpha1.MemberTypeHyperNode,
+			members:    []string{a5Leaf},
+		},
+		{
+			name:       a5Root,
+			tier:       3,
+			tierName:   mixedHyperClusterTierName,
+			memberType: topologyv1alpha1.MemberTypeHyperNode,
+			members:    []string{a5Middle},
+		},
+	}
+
+	for _, hn := range hyperNodes {
+		members := make([]topologyv1alpha1.MemberSpec, 0, len(hn.members))
+		for _, member := range hn.members {
+			members = append(members, topologyv1alpha1.MemberSpec{
+				Type: hn.memberType,
+				Selector: topologyv1alpha1.MemberSelector{
+					ExactMatch: &topologyv1alpha1.ExactMatch{Name: member},
+				},
+			})
+		}
+		spec := &topologyv1alpha1.HyperNode{
+			ObjectMeta: metav1.ObjectMeta{Name: hn.name},
+			Spec: topologyv1alpha1.HyperNodeSpec{
+				Tier:     hn.tier,
+				TierName: hn.tierName,
+				Members:  members,
+			},
+		}
+		Expect(e2eutil.SetupHyperNode(ctx, spec)).To(Succeed())
+	}
+
+	By("Waiting for mixed A3/A5 HyperNodes to be ready")
+	for _, hn := range hyperNodes {
+		name := hn.name
+		Eventually(func() error {
+			_, err := ctx.Vcclient.TopologyV1alpha1().HyperNodes().Get(context.TODO(), name, metav1.GetOptions{})
+			return err
+		}, 30*time.Second, time.Second).Should(Succeed())
+	}
+}
+
+func createPinnedGangJob(ctx *e2eutil.TestContext, name, queue, pri string, req v1.ResourceList, nodes []string, preemptable bool) *batchv1alpha1.Job {
+	labels := map[string]string{}
+	if preemptable {
+		labels[schedulingv1beta1.PodPreemptable] = "true"
+	}
+	terms := make([]v1.NodeSelectorTerm, 0, len(nodes))
+	for _, node := range nodes {
+		terms = append(terms, v1.NodeSelectorTerm{
+			MatchFields: []v1.NodeSelectorRequirement{{
+				Key:      e2eutil.NodeFieldSelectorKeyNodeName,
+				Operator: v1.NodeSelectorOpIn,
+				Values:   []string{node},
+			}},
+		})
+	}
+	affinity := &v1.Affinity{
+		NodeAffinity: &v1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+				NodeSelectorTerms: terms,
+			},
+		},
+	}
+	return e2eutil.CreateJob(ctx, &e2eutil.JobSpec{
+		Name:  name,
+		Queue: queue,
+		Pri:   pri,
+		Min:   int32(len(nodes)),
+		Tasks: []e2eutil.TaskSpec{{
+			Name:        "worker",
+			Img:         e2eutil.DefaultNginxImage,
+			Req:         req,
+			Min:         int32(len(nodes)),
+			Rep:         int32(len(nodes)),
+			Labels:      labels,
+			Affinity:    affinity,
+			Tolerations: kwokTolerations,
+		}},
+	})
+}
+
+func verifyJobPodsOnNodes(ctx *e2eutil.TestContext, job *batchv1alpha1.Job, expectedNodes []string) {
+	pods := e2eutil.GetTasksOfJob(ctx, job)
+	actualNodes := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		actualNodes = append(actualNodes, pod.Spec.NodeName)
+	}
+	Expect(actualNodes).To(ConsistOf(expectedNodes), "job %s should run exactly on the expected topology tree", job.Name)
 }
 
 func createTopologyGangJob(ctx *e2eutil.TestContext, name, queue, pri string, req v1.ResourceList, rep, minAvail int32, preemptable bool, topo *batchv1alpha1.NetworkTopologySpec) *batchv1alpha1.Job {
@@ -941,6 +1090,52 @@ var _ = Describe("GangPreempt E2E Test", func() {
 			err = e2eutil.WaitTasksReady(ctx, victim, 2)
 			Expect(err).NotTo(HaveOccurred())
 		})
+
+		// GP-T5: A3 and A5 map the same semantic boundary to different
+		// numeric tiers. A5 is full but has no lower-priority victim, so the
+		// mixed-tree eviction search must find the eligible A3 victim domain.
+		It("GP-T5: mixed A3/A5 preemption continues to an eligible topology tree", func() {
+			ctx = e2eutil.InitTestContext(e2eutil.Options{
+				Queues: []string{gpQueue},
+				DeservedResource: map[string]v1.ResourceList{
+					gpQueue: deservedCPU(32),
+				},
+				PriorityClasses: map[string]int32{
+					gpHighPri: gpHighPriVal,
+					gpLowPri:  gpLowPriVal,
+				},
+			})
+			setupMixedTopoHyperNodes(ctx, "gpt5")
+			podResources := deservedCPU(7)
+
+			By("Filling A5 with equal-priority tasks that cannot be preempted")
+			blocker := createPinnedGangJob(ctx, "blocker-gpt5", gpQueue, gpHighPri, podResources,
+				mixedTopologyTreeNodes["a5"], true)
+			err := e2eutil.WaitTasksReady(ctx, blocker, 2)
+			Expect(err).NotTo(HaveOccurred())
+			verifyJobPodsOnNodes(ctx, blocker, mixedTopologyTreeNodes["a5"])
+
+			By("Filling A3 with a lower-priority preemptable victim gang")
+			victim := createPinnedGangJob(ctx, "victim-gpt5", gpQueue, gpLowPri, podResources,
+				mixedTopologyTreeNodes["a3"], true)
+			err = e2eutil.WaitTasksReady(ctx, victim, 2)
+			Expect(err).NotTo(HaveOccurred())
+			verifyJobPodsOnNodes(ctx, victim, mixedTopologyTreeNodes["a3"])
+
+			By("Creating a high-priority gang with the shared semantic hypercluster boundary")
+			preemptor := createTopologyGangJob(ctx, "preemptor-gpt5", gpQueue, gpHighPri, podResources, 2, 2, false,
+				&batchv1alpha1.NetworkTopologySpec{
+					Mode:            batchv1alpha1.HardNetworkTopologyMode,
+					HighestTierName: mixedHyperClusterTierName,
+				})
+
+			By("Expecting preemption to succeed only in the eligible A3 tree")
+			err = e2eutil.WaitTasksReady(ctx, preemptor, 2)
+			Expect(err).NotTo(HaveOccurred())
+			verifyJobPodsOnNodes(ctx, preemptor, mixedTopologyTreeNodes["a3"])
+			Eventually(func() int { return countReadyTasks(ctx, victim) }, 30*time.Second, time.Second).Should(Equal(0))
+			Expect(e2eutil.WaitTasksReady(ctx, blocker, 2)).To(Succeed())
+		})
 	})
 })
 
@@ -1482,6 +1677,59 @@ var _ = Describe("GangReclaim E2E Test", func() {
 			By("Expecting victim gang to retain minAvail=2 tasks")
 			err = e2eutil.WaitTasksReady(ctx, victim, 2)
 			Expect(err).NotTo(HaveOccurred())
+		})
+
+		// GR-T5: A5 is occupied by a non-reclaimable queue while A3 contains
+		// reclaimable overuse. The shared tier name resolves to tier 2 in A3
+		// and tier 3 in A5 without merging either tree's local gradients.
+		It("GR-T5: mixed A3/A5 reclaim continues to an eligible topology tree", func() {
+			q1 := "grt5-q1"
+			q2 := "grt5-q2"
+			q3 := "grt5-q3"
+			ctx = e2eutil.InitTestContext(e2eutil.Options{
+				Queues: []string{q1, q2, q3},
+				DeservedResource: map[string]v1.ResourceList{
+					q1: deservedCPU(14),
+					// q2 must be sufficiently below the two-task victim's
+					// usage so gangreclaim returns the complete bundle.
+					q2: deservedCPU(1),
+					q3: deservedCPU(9),
+				},
+				PriorityClasses: map[string]int32{
+					grLowPri: grLowPriVal,
+				},
+			})
+			setupMixedTopoHyperNodes(ctx, "grt5")
+			e2eutil.SetQueueReclaimable(ctx, []string{q3}, false)
+			podResources := deservedCPU(7)
+
+			By("Filling A5 from a non-reclaimable queue")
+			blocker := createPinnedGangJob(ctx, "blocker-grt5", q3, grLowPri, podResources,
+				mixedTopologyTreeNodes["a5"], true)
+			err := e2eutil.WaitTasksReady(ctx, blocker, 2)
+			Expect(err).NotTo(HaveOccurred())
+			verifyJobPodsOnNodes(ctx, blocker, mixedTopologyTreeNodes["a5"])
+
+			By("Filling A3 from an overusing reclaimable queue")
+			victim := createPinnedGangJob(ctx, "victim-grt5", q2, grLowPri, podResources,
+				mixedTopologyTreeNodes["a3"], true)
+			err = e2eutil.WaitTasksReady(ctx, victim, 2)
+			Expect(err).NotTo(HaveOccurred())
+			verifyJobPodsOnNodes(ctx, victim, mixedTopologyTreeNodes["a3"])
+
+			By("Creating a reclaimer with the shared semantic hypercluster boundary")
+			reclaimer := createTopologyGangJob(ctx, "reclaimer-grt5", q1, grLowPri, podResources, 2, 2, false,
+				&batchv1alpha1.NetworkTopologySpec{
+					Mode:            batchv1alpha1.HardNetworkTopologyMode,
+					HighestTierName: mixedHyperClusterTierName,
+				})
+
+			By("Expecting reclaim to succeed only in the eligible A3 tree")
+			err = e2eutil.WaitTasksReady(ctx, reclaimer, 2)
+			Expect(err).NotTo(HaveOccurred())
+			verifyJobPodsOnNodes(ctx, reclaimer, mixedTopologyTreeNodes["a3"])
+			Eventually(func() int { return countReadyTasks(ctx, victim) }, 30*time.Second, time.Second).Should(Equal(0))
+			Expect(e2eutil.WaitTasksReady(ctx, blocker, 2)).To(Succeed())
 		})
 	})
 })

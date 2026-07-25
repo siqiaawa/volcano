@@ -25,6 +25,7 @@ export CLEANUP_CLUSTER=${CLEANUP_CLUSTER:-1}
 export E2E_TYPE=${E2E_TYPE:-"ALL"}
 export ARTIFACTS_PATH=${ARTIFACTS_PATH:-"${VK_ROOT}/volcano-e2e-logs"}
 DRA_GINKGO_FOCUS=${DRA_GINKGO_FOCUS:-"DRA (Quota )?E2E Test"}
+GANGEVICT_GINKGO_FOCUS=${GANGEVICT_GINKGO_FOCUS:-}
 mkdir -p "$ARTIFACTS_PATH"
 
 NAMESPACE=${NAMESPACE:-volcano-system}
@@ -527,7 +528,11 @@ case ${E2E_TYPE} in
     echo "Creating 4 kwok nodes for gang eviction topology tests"
     install-kwok-nodes 4 || exit 1
     echo "Running gang eviction e2e suite..."
-    KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -v -r --slow-spec-threshold='30s' --progress ./test/e2e/gangevict/
+    if [[ -n "${GANGEVICT_GINKGO_FOCUS}" ]]; then
+      KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -v -r --focus="${GANGEVICT_GINKGO_FOCUS}" --slow-spec-threshold='30s' --progress ./test/e2e/gangevict/
+    else
+      KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -v -r --slow-spec-threshold='30s' --progress ./test/e2e/gangevict/
+    fi
     ;;
 "SCHEDULERSHARDING"|"SCHEDULERSHARDING_NONE"|"SCHEDULERSHARDING_SOFT"|"SCHEDULERSHARDING_HARD")
     scheduler_sharding_mode="${E2E_TYPE#SCHEDULERSHARDING_}"

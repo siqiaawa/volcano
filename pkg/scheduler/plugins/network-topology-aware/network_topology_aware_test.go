@@ -19,6 +19,7 @@ package networktopologyaware
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -3661,6 +3662,43 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 			{"a5-superpod-0", "a5-superpod-1"},
 			{"a5-hypernode"},
 		}, gradientNames(gradients))
+	})
+
+	t.Run("eviction keeps each real tree in wider-to-narrower order", func(t *testing.T) {
+		originalLimit := plugin.maxHyperNodesForEviction
+		plugin.maxHyperNodesForEviction = len(hyperNodes)
+		defer func() {
+			plugin.maxHyperNodesForEviction = originalLimit
+		}()
+
+		topology := &scheduling.NetworkTopologySpec{
+			Mode:            scheduling.HardNetworkTopologyMode,
+			HighestTierName: hyperClusterTierName,
+		}
+		gradients, err := plugin.hyperNodeGradientFn(
+			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeEvict)
+		assert.NoError(t, err)
+		gradients = plugin.reverseAndCapEvictionGradients(gradients)
+
+		positions := map[string]int{}
+		position := 0
+		for _, gradient := range gradients {
+			containsA3 := false
+			containsA5 := false
+			for _, hyperNode := range gradient {
+				containsA3 = containsA3 || strings.HasPrefix(hyperNode.Name, "a3-")
+				containsA5 = containsA5 || strings.HasPrefix(hyperNode.Name, "a5-")
+				positions[hyperNode.Name] = position
+				position++
+			}
+			assert.False(t, containsA3 && containsA5, "local tiers from separate real trees must not be merged")
+		}
+		assert.Len(t, positions, len(hyperNodes)-1, "the virtual root is outside the hard boundary")
+		assert.Less(t, positions["a3-hypercluster"], positions["a3-hypernode-0"])
+		assert.Less(t, positions["a3-hypercluster"], positions["a3-hypernode-1"])
+		assert.Less(t, positions["a5-hypercluster"], positions["a5-hypernode"])
+		assert.Less(t, positions["a5-hypernode"], positions["a5-superpod-0"])
+		assert.Less(t, positions["a5-hypernode"], positions["a5-superpod-1"])
 	})
 
 	t.Run("cluster-top numeric boundary preserves legacy soft fallback", func(t *testing.T) {
