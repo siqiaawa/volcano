@@ -624,7 +624,7 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 	var maxScore float64 = -1
 	scoreToNodes := map[float64][]string{}
 	for _, node := range nodes {
-		hyperNode := util.FindHyperNodeForNode(node.Name, ssn.RealNodesList, ssn.HyperNodesTiers, ssn.HyperNodesSetByTier)
+		hyperNode := ssn.FindHyperNodeForNode(node.Name)
 		score := nta.networkTopologyAwareScore(hyperNode, allocatedHyperNode, ssn)
 		nodeScores[node.Name] = score
 		if score >= maxScore {
@@ -636,7 +636,7 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 	if len(scoreToNodes[maxScore]) > 1 {
 		candidateNodes := scoreToNodes[maxScore]
 		for _, node := range candidateNodes {
-			hyperNode := util.FindHyperNodeForNode(node, ssn.RealNodesList, ssn.HyperNodesTiers, ssn.HyperNodesSetByTier)
+			hyperNode := ssn.FindHyperNodeForNode(node)
 			taskNumScore := nta.scoreWithTaskNum(hyperNode, subJob.Tasks, ssn.RealNodesList)
 			nodeScores[node] += taskNumScore
 		}

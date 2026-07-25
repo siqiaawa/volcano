@@ -868,7 +868,7 @@ func (alloc *Action) allocateResourcesForTasks(subJob *api.SubJobInfo, tasks *ut
 
 // getNewAllocatedHyperNode Obtain the newly allocated hyperNode for the job in soft topology mode
 func getNewAllocatedHyperNode(ssn *framework.Session, bestNode string, jobAllocatedHyperNode string) string {
-	hyperNode := util.FindHyperNodeForNode(bestNode, ssn.RealNodesList, ssn.HyperNodesTiers, ssn.HyperNodesSetByTier)
+	hyperNode := ssn.FindHyperNodeForNode(bestNode)
 	if hyperNode != "" {
 		if jobAllocatedHyperNode == "" {
 			return hyperNode

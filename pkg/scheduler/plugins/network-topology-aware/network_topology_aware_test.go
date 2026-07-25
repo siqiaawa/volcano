@@ -3486,6 +3486,67 @@ func TestBatchNodeOrderFnForNormalPodsUsesTreeLocalTiers(t *testing.T) {
 		"the virtual cluster root should remain the final fading level of a real tree")
 }
 
+func TestBatchNodeOrderFnForNetworkAwarePodsUsesTreeLocalLeaf(t *testing.T) {
+	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
+		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+		info.Children.Insert(children...)
+		return info
+	}
+
+	a3Node := &api.NodeInfo{Name: "a3-node"}
+	a5Node := &api.NodeInfo{Name: "a5-node"}
+	hyperNodes := api.HyperNodeInfoMap{
+		"a3-leaf": newHyperNode("a3-leaf", 1),
+		"a3-root": newHyperNode("a3-root", 2, "a3-leaf"),
+		"a5-leaf": newHyperNode("a5-leaf", 0),
+		"a5-mid":  newHyperNode("a5-mid", 1, "a5-leaf"),
+		"a5-root": newHyperNode("a5-root", 2, "a5-mid"),
+		framework.ClusterTopHyperNode: newHyperNode(
+			framework.ClusterTopHyperNode, 3, "a3-root", "a5-root"),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+
+	ssn := &framework.Session{
+		HyperNodes:      hyperNodes,
+		HyperNodesTiers: []int{0, 1, 2, 3},
+		HyperNodesSetByTier: map[int]sets.Set[string]{
+			0: sets.New[string]("a5-leaf"),
+			1: sets.New[string]("a3-leaf", "a5-mid"),
+			2: sets.New[string]("a3-root", "a5-root"),
+			3: sets.New[string](framework.ClusterTopHyperNode),
+		},
+		RealNodesList: map[string][]*api.NodeInfo{
+			"a3-leaf":                     {a3Node},
+			"a3-root":                     {a3Node},
+			"a5-leaf":                     {a5Node},
+			"a5-mid":                      {a5Node},
+			"a5-root":                     {a5Node},
+			framework.ClusterTopHyperNode: {a3Node, a5Node},
+		},
+		RealNodesSet: map[string]sets.Set[string]{
+			"a3-leaf":                     sets.New[string](a3Node.Name),
+			"a3-root":                     sets.New[string](a3Node.Name),
+			"a5-leaf":                     sets.New[string](a5Node.Name),
+			"a5-mid":                      sets.New[string](a5Node.Name),
+			"a5-root":                     sets.New[string](a5Node.Name),
+			framework.ClusterTopHyperNode: sets.New[string](a3Node.Name, a5Node.Name),
+		},
+	}
+	plugin := &networkTopologyAwarePlugin{}
+	task := &api.TaskInfo{
+		TransactionContext: api.TransactionContext{JobAllocatedHyperNode: "a3-leaf"},
+	}
+
+	scores, err := plugin.batchNodeOrderFnForNetworkAwarePods(ssn, task, &api.SubJobInfo{}, []*api.NodeInfo{a3Node})
+	assert.NoError(t, err)
+	assert.Equal(t, FullScore, scores[a3Node.Name],
+		"the A3 Node must resolve its own leaf even when another tree has a lower numeric tier")
+}
+
 func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 	const (
 		hyperNodeTierName    = "volcano.sh/hypernode"

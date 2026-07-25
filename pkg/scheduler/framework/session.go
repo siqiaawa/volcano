@@ -339,6 +339,38 @@ func (ssn *Session) EnsureTopologyTrees() {
 	ssn.buildTopologyTrees()
 }
 
+// FindHyperNodeForNode returns the lowest local-tier HyperNode containing the
+// Node. The virtual cluster root is intentionally excluded.
+func (ssn *Session) FindHyperNodeForNode(nodeName string) string {
+	ssn.EnsureTopologyTrees()
+
+	var matchedTree *TopologyTree
+	for _, tree := range ssn.TopologyTrees {
+		if !tree.RealNodes.Has(nodeName) {
+			continue
+		}
+		if matchedTree != nil {
+			klog.Warningf("node %s belongs to multiple real HyperNode trees", nodeName)
+			return ""
+		}
+		matchedTree = tree
+	}
+	if matchedTree == nil {
+		return ""
+	}
+
+	for _, tier := range matchedTree.Tiers {
+		hyperNodes := matchedTree.ByTier[tier].UnsortedList()
+		sort.Strings(hyperNodes)
+		for _, hyperNode := range hyperNodes {
+			if ssn.RealNodesSet[hyperNode].Has(nodeName) {
+				return hyperNode
+			}
+		}
+	}
+	return ""
+}
+
 func (ssn *Session) topologyTreesCurrent() bool {
 	if ssn.TopologyTrees == nil || ssn.HyperNodeToTopologyTree == nil {
 		return false
