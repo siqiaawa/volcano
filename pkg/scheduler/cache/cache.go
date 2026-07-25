@@ -232,9 +232,10 @@ func (db *DefaultBinder) Bind(kubeClient kubernetes.Interface, tasks []*scheduli
 	for _, task := range tasks {
 		p := task.Pod
 		startTime := time.Now()
+		// The apiserver overlays Binding annotations onto the Pod during bind.
 		if err := db.kubeclient.CoreV1().Pods(p.Namespace).Bind(context.TODO(),
 			&v1.Binding{
-				ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: p.Name, UID: p.UID, Annotations: p.Annotations},
+				ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: p.Name, UID: p.UID, Annotations: task.PodAnnotations},
 				Target: v1.ObjectReference{
 					Kind: "Node",
 					Name: task.NodeName,
@@ -1048,22 +1049,24 @@ func (sc *SchedulerCache) SetSharedInformerFactory(factory informers.SharedInfor
 	sc.informerFactory = factory
 }
 
-// UpdateSchedulerNumaInfo used to update scheduler node cache NumaSchedulerInfo
-func (sc *SchedulerCache) UpdateSchedulerNumaInfo(AllocatedSets map[string]schedulingapi.ResNumaSets) error {
+// AddUnassignedNumaPods adds the pods that are newly-scheduled but has not been allocated resources to nodes' UnassignedNumaPods
+func (sc *SchedulerCache) AddUnassignedNumaPods(allocatedSets map[schedulingapi.PodMeta]map[string]schedulingapi.ResNumaSets) error {
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
 
-	for nodeName, sets := range AllocatedSets {
-		if _, found := sc.Nodes[nodeName]; !found {
-			continue
+	for podMeta, podAlloc := range allocatedSets {
+		for nodeName, resSets := range podAlloc {
+			node, found := sc.Nodes[nodeName]
+			if !found || node == nil {
+				klog.Warningf("failed to find node %s, skip adding unassigned pod %v with resourceSet %v to it", nodeName, podMeta, resSets)
+				continue
+			}
+			if node.UnassignedNumaPods == nil {
+				node.UnassignedNumaPods = make(map[schedulingapi.PodMeta]schedulingapi.ResNumaSets)
+			}
+			node.UnassignedNumaPods[podMeta] = resSets
+			klog.V(3).Infof("added pod %v with resourceSet %v to the unassigned numa pods of node %s", podMeta, resSets, nodeName)
 		}
-
-		numaInfo := sc.Nodes[nodeName].NumaSchedulerInfo
-		if numaInfo == nil {
-			continue
-		}
-
-		numaInfo.Allocate(sets)
 	}
 	return nil
 }
@@ -1875,6 +1878,27 @@ func (e *pendingDRAResourceClaimError) Error() string {
 
 func isPendingDRAResourceClaimError(err error) bool {
 	_, ok := err.(*pendingDRAResourceClaimError)
+	return ok
+}
+
+// pendingPVCError marks a NewTaskInfo failure caused by a
+// PersistentVolumeClaim the pod references not yet being present in the
+// scheduler's PVC informer (a not-found lookup). It is treated like
+// pendingDRAResourceClaimError: the task is still added to the cache and
+// re-queued for resync so it is retried once the PVC informer catches up,
+// rather than being dropped. Using a dedicated type, created only for the
+// not-found case, keeps the retry path scoped to exactly this race and does
+// not swallow other lookup errors.
+type pendingPVCError struct {
+	err error
+}
+
+func (e *pendingPVCError) Error() string {
+	return e.err.Error()
+}
+
+func isPendingPVCError(err error) bool {
+	_, ok := err.(*pendingPVCError)
 	return ok
 }
 

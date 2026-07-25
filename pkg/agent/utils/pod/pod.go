@@ -21,8 +21,11 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
+	helpers "k8s.io/component-helpers/resource"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
+	k8sfeature "k8s.io/kubernetes/pkg/features"
 
 	"volcano.sh/volcano/pkg/agent/apis/extension"
 	"volcano.sh/volcano/pkg/agent/utils"
@@ -64,6 +67,16 @@ func (s SortedPodsByRequestCPU) Less(i, j int) bool {
 	for _, c := range s[j].Spec.Containers {
 		r2 += c.Resources.Requests.Cpu().Value()
 	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(k8sfeature.PodLevelResources) {
+		if podLevelResource, found := getPodLevelResourceRequest(s[i], v1.ResourceCPU); found {
+			r1 = podLevelResource.Value()
+		}
+		if podLevelResource, found := getPodLevelResourceRequest(s[j], v1.ResourceCPU); found {
+			r2 = podLevelResource.Value()
+		}
+	}
+
 	return r1 > r2
 }
 
@@ -80,6 +93,16 @@ func (s SortedPodsByRequestMemory) Less(i, j int) bool {
 	for _, c := range s[j].Spec.Containers {
 		r2 += c.Resources.Requests.Memory().Value()
 	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(k8sfeature.PodLevelResources) {
+		if podLevelResource, found := getPodLevelResourceRequest(s[i], v1.ResourceMemory); found {
+			r1 = podLevelResource.Value()
+		}
+		if podLevelResource, found := getPodLevelResourceRequest(s[j], v1.ResourceMemory); found {
+			r2 = podLevelResource.Value()
+		}
+	}
+
 	return r1 > r2
 }
 
@@ -169,6 +192,13 @@ func getTotalRequestByType(pods []*v1.Pod, fns []FilterPodsFunc, resType v1.Reso
 			}
 			podRes = maxResourceReq(podRes, resValue)
 		}
+
+		if utilfeature.DefaultFeatureGate.Enabled(k8sfeature.PodLevelResources) && helpers.IsSupportedPodLevelResource(resType) {
+			if podLevelResource, found := getPodLevelResourceRequest(pod, resType); found {
+				podRes = podLevelResource
+			}
+		}
+
 		totalRes.Add(podRes)
 	}
 
@@ -186,4 +216,15 @@ func maxResourceReq(res, newRes resource.Quantity) resource.Quantity {
 // IsPodTerminated return true if pod is terminated.
 func IsPodTerminated(pod *v1.Pod) bool {
 	return pod.DeletionTimestamp != nil || pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed
+}
+
+func getPodLevelResourceRequest(pod *v1.Pod, rName v1.ResourceName) (resource.Quantity, bool) {
+	if pod == nil {
+		return resource.Quantity{}, false
+	}
+	if pod.Spec.Resources != nil && len(pod.Spec.Resources.Requests) != 0 {
+		resValue, found := pod.Spec.Resources.Requests[rName]
+		return resValue, found
+	}
+	return resource.Quantity{}, false
 }
