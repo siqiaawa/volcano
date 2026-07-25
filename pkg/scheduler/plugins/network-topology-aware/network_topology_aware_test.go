@@ -3404,6 +3404,88 @@ func Test_batchNodeOrderFnForNormalPods(t *testing.T) {
 	}
 }
 
+func TestBatchNodeOrderFnForNormalPodsUsesTreeLocalTiers(t *testing.T) {
+	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
+		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+		info.Children.Insert(children...)
+		return info
+	}
+
+	hyperNodes := api.HyperNodeInfoMap{
+		"a3-leaf": newHyperNode("a3-leaf", 1),
+		"a3-root": newHyperNode("a3-root", 2, "a3-leaf"),
+		"a5-leaf": newHyperNode("a5-leaf", 1),
+		"a5-mid":  newHyperNode("a5-mid", 2, "a5-leaf"),
+		"a5-root": newHyperNode("a5-root", 3, "a5-mid"),
+		framework.ClusterTopHyperNode: newHyperNode(
+			framework.ClusterTopHyperNode, 4, "a3-root", "a5-root"),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+
+	ssn := &framework.Session{
+		HyperNodes: hyperNodes,
+		HyperNodesSetByTier: map[int]sets.Set[string]{
+			1: sets.New[string]("a3-leaf", "a5-leaf"),
+			2: sets.New[string]("a3-root", "a5-mid"),
+			3: sets.New[string]("a5-root"),
+			4: sets.New[string](framework.ClusterTopHyperNode),
+		},
+		RealNodesSet: map[string]sets.Set[string]{
+			"a3-leaf":                     sets.New[string]("a3-node"),
+			"a3-root":                     sets.New[string]("a3-node"),
+			"a5-leaf":                     sets.New[string]("a5-node"),
+			"a5-mid":                      sets.New[string]("a5-node"),
+			"a5-root":                     sets.New[string]("a5-node"),
+			framework.ClusterTopHyperNode: sets.New[string]("a3-node", "a5-node", "outside-node"),
+		},
+	}
+
+	plugin := &networkTopologyAwarePlugin{
+		weight: &priorityWeight{
+			HyperNodeBinPackingCPU: 1,
+		},
+		normalPodConfig: &normalPodConfig{
+			hyperNodeBinPackingEnable: true,
+			hyperNodeBinPackingFading: 0.5,
+		},
+		hyperNodesTier:         &hyperNodesTier{minTier: 1, maxTier: 4},
+		hyperNodeResourceCache: map[string]*resourceStatus{},
+	}
+	for name := range hyperNodes {
+		plugin.hyperNodeResourceCache[name] = &resourceStatus{
+			allocatable: &api.Resource{MilliCPU: 100},
+			used:        &api.Resource{MilliCPU: 40},
+		}
+	}
+
+	task := &api.TaskInfo{
+		Name:   "normal-pod",
+		Resreq: &api.Resource{MilliCPU: 10},
+	}
+	nodes := []*api.NodeInfo{{Name: "a3-node"}, {Name: "a5-node"}, {Name: "outside-node"}}
+
+	scores, err := plugin.batchNodeOrderFnForNormalPods(ssn, task, nodes)
+	assert.NoError(t, err)
+	assert.InDelta(t, 0.5, scores["a3-node"], 1e-9)
+	assert.InDelta(t, 0.5, scores["a5-node"], 1e-9)
+	assert.InDelta(t, scores["a3-node"], scores["a5-node"], 1e-9,
+		"equivalent local topology utilization must not favor the shallower tree")
+	assert.Equal(t, FullScore, scores["outside-node"],
+		"a Node outside all real topology trees should retain the preferred fallback score")
+
+	plugin.hyperNodeResourceCache["a3-leaf"].used.MilliCPU = 10
+	plugin.hyperNodeResourceCache["a3-root"].used.MilliCPU = 30
+	plugin.hyperNodeResourceCache[framework.ClusterTopHyperNode].used.MilliCPU = 70
+	scores, err = plugin.batchNodeOrderFnForNormalPods(ssn, task, nodes[:1])
+	assert.NoError(t, err)
+	assert.InDelta(t, (0.2+0.4*0.5+0.8*0.25)/(1+0.5+0.25), scores["a3-node"], 1e-9,
+		"the virtual cluster root should remain the final fading level of a real tree")
+}
+
 func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 	const (
 		hyperNodeTierName    = "volcano.sh/hypernode"
