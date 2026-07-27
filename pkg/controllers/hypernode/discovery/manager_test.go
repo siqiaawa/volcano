@@ -17,6 +17,7 @@ limitations under the License.
 package discovery
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/workqueue"
 
@@ -34,6 +36,26 @@ import (
 	"volcano.sh/volcano/pkg/controllers/hypernode/config"
 	fakedisc "volcano.sh/volcano/pkg/controllers/hypernode/discovery/fake"
 )
+
+type startFailingDiscoverer struct {
+	stopCalled bool
+}
+
+func (f *startFailingDiscoverer) Start() (chan []*topologyv1alpha1.HyperNode, error) {
+	return nil, errors.New("invalid discovery config")
+}
+
+func (f *startFailingDiscoverer) Stop() error {
+	f.stopCalled = true
+	return nil
+}
+
+func (f *startFailingDiscoverer) Name() string {
+	return "start-failing"
+}
+
+func (f *startFailingDiscoverer) ResultSynced() {
+}
 
 func TestManager_StartMultipleDiscoverers(t *testing.T) {
 	// Prepare test data
@@ -171,4 +193,34 @@ func TestManager_syncHandler(t *testing.T) {
 
 	// Stop the manager
 	m.Stop()
+}
+
+func TestManagerDoesNotRegisterDiscovererThatFailsToStart(t *testing.T) {
+	const source = "startFailingSource"
+	failingDiscoverer := &startFailingDiscoverer{}
+	api.RegisterDiscoverer(source, func(api.DiscoveryConfig, clientset.Interface, vcclientset.Interface) api.Discoverer {
+		return failingDiscoverer
+	})
+
+	discoveryConfig := &api.NetworkTopologyConfig{
+		NetworkTopologyDiscovery: []api.DiscoveryConfig{{
+			Source:  source,
+			Enabled: true,
+		}},
+	}
+	loader := config.NewFakeLoader(discoveryConfig)
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	m := NewManager(loader, queue, fake.NewSimpleClientset(), fakevcclientset.NewSimpleClientset())
+	require.NoError(t, m.Start())
+	defer func() {
+		m.Stop()
+		queue.ShutDown()
+	}()
+
+	mgr := m.(*manager)
+	err := mgr.syncHandler("test-namespace/test-config")
+	require.ErrorContains(t, err, "invalid discovery config")
+	assert.True(t, failingDiscoverer.stopCalled, "failed discoverer should be cleaned up")
+	_, exists := mgr.discoverers[source]
+	assert.False(t, exists, "failed discoverer must not receive future ResultSynced notifications")
 }

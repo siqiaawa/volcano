@@ -143,12 +143,14 @@ func (m *manager) startSingleDiscoverer(source string) error {
 		return fmt.Errorf("failed to create discoverer: %v", err)
 	}
 
-	m.discoverers[source] = discoverer
-
 	outputCh, err := discoverer.Start()
 	if err != nil {
+		if stopErr := discoverer.Stop(); stopErr != nil {
+			klog.ErrorS(stopErr, "Failed to clean up discoverer after start failure", "source", source)
+		}
 		return fmt.Errorf("failed to start discoverer: %v", err)
 	}
+	m.discoverers[source] = discoverer
 
 	go m.processTopology(source, outputCh)
 

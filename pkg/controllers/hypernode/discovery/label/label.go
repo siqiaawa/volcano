@@ -17,8 +17,10 @@ limitations under the License.
 package label
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -27,8 +29,9 @@ import (
 	"github.com/mitchellh/mapstructure"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/informers"
 	infov1 "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -48,7 +51,6 @@ import (
 
 const (
 	networkTopologyTypeLength = 20
-	loopCount                 = 20
 )
 
 func init() {
@@ -58,11 +60,28 @@ func init() {
 // NodeLabel represents a label associated with a node in the network topology.
 type NodeLabel struct {
 	NodeLabel string `mapstructure:"nodeLabel"`
+	TierName  string `mapstructure:"tierName"`
 }
 
 // NetworkTopologyType defines the structure that holds different types of network topologies.
 type NetworkTopologyType struct {
-	NetworkTopologyTypes map[string][]NodeLabel `mapstructure:"networkTopologyTypes"`
+	NetworkTopologyTypes map[string]interface{} `mapstructure:"networkTopologyTypes"`
+}
+
+// NetworkTopologyProfile is the extended topology configuration. Levels use
+// node labels to identify domains and tierName to expose a shared semantic
+// boundary to the scheduler.
+type NetworkTopologyProfile struct {
+	NodeSelector *metav1.LabelSelector `mapstructure:"nodeSelector"`
+	Levels       []NodeLabel           `mapstructure:"levels"`
+}
+
+type topologyProfile struct {
+	name               string
+	labelValue         string
+	nodeSelector       labels.Selector
+	selectorConfigured bool
+	levels             []NodeLabel
 }
 
 // HyperNodeInfo contains detailed information about a HyperNode, which is used to describe the hypernode's tier, members, and label attributes.
@@ -75,20 +94,26 @@ type HyperNodeInfo struct {
 
 // labelDiscoverer implements the Discoverer interface for label
 type labelDiscoverer struct {
-	nodeInformer          infov1.NodeInformer
-	hyperNodeInformer     topologyinformerv1alpha1.HyperNodeInformer
-	informerFactory       informers.SharedInformerFactory
-	vcInformerFactory     vcinformer.SharedInformerFactory
-	networkTopologyRecord map[string][]string
-	outputCh              chan []*topologyv1alpha1.HyperNode
-	stopCh                chan struct{}
-	completedCh           chan struct{}
-	queue                 workqueue.TypedRateLimitingInterface[string]
-	hyperNodeLister       topologylisterv1alpha1.HyperNodeLister
+	nodeInformer         infov1.NodeInformer
+	hyperNodeInformer    topologyinformerv1alpha1.HyperNodeInformer
+	informerFactory      informers.SharedInformerFactory
+	vcInformerFactory    vcinformer.SharedInformerFactory
+	topologyProfiles     []topologyProfile
+	watchedNodeLabelKeys map[string]struct{}
+	configErr            error
+	outputCh             chan []*topologyv1alpha1.HyperNode
+	stopCh               chan struct{}
+	completedCh          chan struct{}
+	queue                workqueue.TypedRateLimitingInterface[string]
+	hyperNodeLister      topologylisterv1alpha1.HyperNodeLister
 }
 
 // Start begins the topology discovery process and returns the channel for receiving discovered topology
 func (l *labelDiscoverer) Start() (chan []*topologyv1alpha1.HyperNode, error) {
+	if l.configErr != nil {
+		return nil, l.configErr
+	}
+
 	l.nodeInformer.Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    l.AddNode,
@@ -142,7 +167,7 @@ func (l *labelDiscoverer) Name() string {
 // NewLabelDiscoverer creates a new label topology discoverer
 func NewLabelDiscoverer(cfg api.DiscoveryConfig, kubeClient clientset.Interface, vcClient vcclientset.Interface) api.Discoverer {
 	// parse config
-	networkTopologyRecord := parseCfg(cfg)
+	topologyProfiles, watchedNodeLabelKeys, configErr := parseCfg(cfg)
 
 	// Create the output channel that this discoverer will manage
 	outputCh := make(chan []*topologyv1alpha1.HyperNode)
@@ -158,56 +183,146 @@ func NewLabelDiscoverer(cfg api.DiscoveryConfig, kubeClient clientset.Interface,
 	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 
 	return &labelDiscoverer{
-		informerFactory:       informerFactory,
-		nodeInformer:          nodeInformer,
-		vcInformerFactory:     vcInformerFactory,
-		hyperNodeInformer:     hyperNodeInformer,
-		networkTopologyRecord: networkTopologyRecord,
-		outputCh:              outputCh,
-		stopCh:                stopCh,
-		completedCh:           completedCh,
-		queue:                 queue,
-		hyperNodeLister:       hyperNodeLister,
+		informerFactory:      informerFactory,
+		nodeInformer:         nodeInformer,
+		vcInformerFactory:    vcInformerFactory,
+		hyperNodeInformer:    hyperNodeInformer,
+		topologyProfiles:     topologyProfiles,
+		watchedNodeLabelKeys: watchedNodeLabelKeys,
+		configErr:            configErr,
+		outputCh:             outputCh,
+		stopCh:               stopCh,
+		completedCh:          completedCh,
+		queue:                queue,
+		hyperNodeLister:      hyperNodeLister,
 	}
 }
 
-// parseCfg Parse the ConfigMap and read the topology information.
-func parseCfg(cfg api.DiscoveryConfig) map[string][]string {
+// parseCfg parses legacy topology lists and extended topology profiles.
+func parseCfg(cfg api.DiscoveryConfig) ([]topologyProfile, map[string]struct{}, error) {
 	klog.InfoS("Start parse label based hyperNode auto discovery config")
 
-	networkTopologyRecord := make(map[string][]string)
-
 	var config NetworkTopologyType
-
-	if err := mapstructure.WeakDecode(cfg.Config, &config); err != nil {
-		klog.Errorf("Cannot get networkTopologyTypes, %s %T, error is %v", cfg.Config, cfg.Config, err)
-		return networkTopologyRecord
+	if err := strictWeakDecode(cfg.Config, &config); err != nil {
+		return nil, nil, fmt.Errorf("decode networkTopologyTypes: %w", err)
+	}
+	if len(config.NetworkTopologyTypes) == 0 {
+		return nil, nil, errors.New("networkTopologyTypes must contain at least one topology profile")
 	}
 
-	for name, labels := range config.NetworkTopologyTypes {
+	names := make([]string, 0, len(config.NetworkTopologyTypes))
+	for name := range config.NetworkTopologyTypes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	profiles := make([]topologyProfile, 0, len(names))
+	watchedNodeLabelKeys := make(map[string]struct{})
+	profileByLabelValue := make(map[string]string)
+	for _, name := range names {
 		if len(name) > networkTopologyTypeLength {
-			klog.Errorf("The length of topologyTypeName exceeds 20. topologyTypeName is %s", name)
-			continue
+			return nil, nil, fmt.Errorf("topology profile name %q exceeds %d characters", name, networkTopologyTypeLength)
 		}
 
-		if err := checkLabels(labels); err != nil {
-			klog.Errorf("The configMap format is incorrect, label is %v, error is %v", labels, err)
-			continue
+		rawProfile := config.NetworkTopologyTypes[name]
+		profileConfig := NetworkTopologyProfile{}
+		legacyConfig := reflect.ValueOf(rawProfile).IsValid() && reflect.ValueOf(rawProfile).Kind() == reflect.Slice
+		if legacyConfig {
+			if err := strictWeakDecode(rawProfile, &profileConfig.Levels); err != nil {
+				return nil, nil, fmt.Errorf("decode legacy topology profile %q: %w", name, err)
+			}
+		} else if err := strictWeakDecode(rawProfile, &profileConfig); err != nil {
+			return nil, nil, fmt.Errorf("decode topology profile %q: %w", name, err)
 		}
-		networkTopologyRecord[name] = make([]string, 0)
+
+		if err := checkLabels(profileConfig.Levels); err != nil {
+			return nil, nil, fmt.Errorf("invalid topology profile %q: %w", name, err)
+		}
+		if len(profileConfig.Levels) < 2 {
+			return nil, nil, fmt.Errorf("invalid topology profile %q: at least one topology level and one node level are required", name)
+		}
+		leafLevel := profileConfig.Levels[len(profileConfig.Levels)-1]
+		if leafLevel.NodeLabel != v1.LabelHostname {
+			return nil, nil, fmt.Errorf("invalid topology profile %q: last level must use nodeLabel %q", name, v1.LabelHostname)
+		}
+		if leafLevel.TierName != "" {
+			return nil, nil, fmt.Errorf("invalid topology profile %q: node leaf level must not set tierName", name)
+		}
+
+		selector := labels.Everything()
+		if profileConfig.NodeSelector != nil {
+			var err error
+			selector, err = metav1.LabelSelectorAsSelector(profileConfig.NodeSelector)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid nodeSelector for topology profile %q: %w", name, err)
+			}
+			for key := range profileConfig.NodeSelector.MatchLabels {
+				watchedNodeLabelKeys[key] = struct{}{}
+			}
+			for _, expression := range profileConfig.NodeSelector.MatchExpressions {
+				watchedNodeLabelKeys[expression.Key] = struct{}{}
+			}
+		}
+
+		levels := make([]NodeLabel, 0, len(profileConfig.Levels)-1)
+		seenTierNames := make(map[string]struct{})
 		// kubernetes.io/hostname refers to a node label, not a hypernode label. This level of label needs to be removed during traversal.
-		for i := len(labels) - 2; i >= 0; i-- {
-			networkTopologyRecord[name] = append(networkTopologyRecord[name], labels[i].NodeLabel)
+		for i := len(profileConfig.Levels) - 2; i >= 0; i-- {
+			level := profileConfig.Levels[i]
+			if level.TierName == "" {
+				level.TierName = level.NodeLabel
+			}
+			if _, exists := seenTierNames[level.TierName]; exists {
+				return nil, nil, fmt.Errorf("invalid topology profile %q: duplicate tierName %q", name, level.TierName)
+			}
+			seenTierNames[level.TierName] = struct{}{}
+			levels = append(levels, level)
+			watchedNodeLabelKeys[level.NodeLabel] = struct{}{}
 		}
-	}
-	klog.InfoS("Successfully parsed label based hyperNode auto discovery config", "networkTopologyRecord", networkTopologyRecord)
 
-	return networkTopologyRecord
+		labelValue := strings.Trim(cleanString(name), ".-")
+		if labelValue == "" {
+			return nil, nil, fmt.Errorf("topology profile name %q cannot be normalized to a label value", name)
+		}
+		if validationErrors := validation.IsValidLabelValue(labelValue); len(validationErrors) > 0 {
+			return nil, nil, fmt.Errorf("topology profile name %q has invalid normalized label value %q: %s", name, labelValue, strings.Join(validationErrors, "; "))
+		}
+		if existingName, exists := profileByLabelValue[labelValue]; exists {
+			return nil, nil, fmt.Errorf("topology profile names %q and %q normalize to the same label value %q", existingName, name, labelValue)
+		}
+		profileByLabelValue[labelValue] = name
+		profiles = append(profiles, topologyProfile{
+			name:               name,
+			labelValue:         labelValue,
+			nodeSelector:       selector,
+			selectorConfigured: profileConfig.NodeSelector != nil,
+			levels:             levels,
+		})
+	}
+	klog.InfoS("Successfully parsed label based hyperNode auto discovery config", "profileCount", len(profiles))
+
+	return profiles, watchedNodeLabelKeys, nil
+}
+
+func strictWeakDecode(input, output interface{}) error {
+	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		ErrorUnused:      true,
+		WeaklyTypedInput: true,
+		ZeroFields:       true,
+		Result:           output,
+	})
+	if err != nil {
+		return err
+	}
+	return decoder.Decode(input)
 }
 
 func checkLabels(labels []NodeLabel) error {
 	seen := make(map[string]bool)
 	for _, label := range labels {
+		if label.NodeLabel == "" {
+			return errors.New("nodeLabel cannot be empty")
+		}
 		if _, exist := seen[label.NodeLabel]; !exist {
 			seen[label.NodeLabel] = true
 			continue
@@ -224,6 +339,7 @@ func (l *labelDiscoverer) work() {
 			return
 		}
 
+		discoverySucceeded := false
 		func() {
 			defer l.queue.Done(key)
 			if err := l.discovery(); err != nil {
@@ -233,8 +349,16 @@ func (l *labelDiscoverer) work() {
 			}
 
 			l.queue.Forget(key)
+			discoverySucceeded = true
 		}()
-		<-l.completedCh
+		if !discoverySucceeded {
+			continue
+		}
+		select {
+		case <-l.completedCh:
+		case <-l.stopCh:
+			return
+		}
 	}
 }
 
@@ -343,12 +467,10 @@ func (l *labelDiscoverer) getNodeNetworkTopologyLabels(obj interface{}) map[stri
 		return tempMap
 	}
 	labelMap := node.Labels
-	for _, labelKey := range l.networkTopologyRecord {
-		for _, key := range labelKey {
-			value, exist := labelMap[key]
-			if exist {
-				tempMap[key] = value
-			}
+	for key := range l.watchedNodeLabelKeys {
+		value, exist := labelMap[key]
+		if exist {
+			tempMap[key] = value
 		}
 	}
 	return tempMap
@@ -371,8 +493,15 @@ func (l *labelDiscoverer) generateHyperNodeInfo() (map[string]HyperNodeInfo, err
 	// Record the hyperNode and its info.
 	hyperNodeInfoMap := make(map[string]HyperNodeInfo)
 
-	// Record the label and hyperNodeName.
-	labelHyperNodeMap := make(map[string]map[string]string)
+	// Domain identity is profile-scoped. Two profiles may intentionally use
+	// the same node label and value while representing independent networks.
+	type domainKey struct {
+		profile   string
+		nodeLabel string
+		value     string
+	}
+	domainHyperNodeMap := make(map[domainKey]string)
+	parentByHyperNode := make(map[string]string)
 
 	// Get all node
 	list, err := l.nodeInformer.Lister().List(labels.Everything())
@@ -381,57 +510,94 @@ func (l *labelDiscoverer) generateHyperNodeInfo() (map[string]HyperNodeInfo, err
 		return hyperNodeInfoMap, err
 	}
 
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Name < list[j].Name
+	})
 	for _, node := range list {
 		labelMap := node.Labels
-		for topologyTypeName, labelKey := range l.networkTopologyRecord {
-			memberName := node.Name
-			for i, key := range labelKey {
-				value, exists := labelMap[key]
-				if !exists {
-					klog.V(5).Info("The label does not exist in the node")
-					break
-				}
-				tier := i + 1
-				hyperNodeName, exists := getHyperNodeCached(labelHyperNodeMap, key, value)
-				if !exists {
-					// Construct hyperNodeName
-					hyperNodeName, err = l.buildHyperNodeName(topologyTypeName, key, value, tier, hyperNodeInfoMap)
-					if err != nil {
-						klog.Errorf("Failed to build hyperNode resources, error is %v", err.Error())
-						return hyperNodeInfoMap, err
-					}
-				}
+		profile, err := l.profileForNode(node)
+		if err != nil {
+			return hyperNodeInfoMap, err
+		}
+		if profile == nil {
+			continue
+		}
 
-				// Record the members of the hyperNode
-				_, exists = hyperNodeInfoMap[hyperNodeName]
-				if !exists {
-					hyperNodeInfoMap[hyperNodeName] = HyperNodeInfo{
-						tier:     tier,
-						tierName: key,
-						members:  make([]string, 0),
-						labels:   map[string]string{key: value},
-					}
+		memberName := node.Name
+		for i, level := range profile.levels {
+			value, exists := labelMap[level.NodeLabel]
+			if !exists {
+				if profile.selectorConfigured {
+					return hyperNodeInfoMap, fmt.Errorf("node %s selected by topology profile %s is missing level label %s", node.Name, profile.name, level.NodeLabel)
 				}
-				hyperNodeInfo := hyperNodeInfoMap[hyperNodeName]
-				hyperNodeInfo.members = append(hyperNodeInfo.members, memberName)
-				hyperNodeInfoMap[hyperNodeName] = hyperNodeInfo
-
-				// Record the label and hyperNodeName.
-				if _, exists := labelHyperNodeMap[key]; exists {
-					labelHyperNodeMap[key][value] = hyperNodeName
-				} else {
-					labelHyperNodeMap[key] = map[string]string{
-						value: hyperNodeName,
-					}
-				}
-				memberName = hyperNodeName
+				klog.V(5).InfoS("Topology level label does not exist on node", "node", node.Name, "profile", profile.name, "label", level.NodeLabel)
+				break
 			}
+
+			tier := i + 1
+			cacheKey := domainKey{profile: profile.name, nodeLabel: level.NodeLabel, value: value}
+			hyperNodeName, exists := domainHyperNodeMap[cacheKey]
+			if !exists {
+				hyperNodeName, err = l.buildHyperNodeName(*profile, level.NodeLabel, value, tier, hyperNodeInfoMap)
+				if err != nil {
+					return hyperNodeInfoMap, fmt.Errorf("build HyperNode for profile %s: %w", profile.name, err)
+				}
+				domainHyperNodeMap[cacheKey] = hyperNodeName
+			}
+
+			hyperNodeInfo, exists := hyperNodeInfoMap[hyperNodeName]
+			if !exists {
+				hyperNodeInfo = HyperNodeInfo{
+					tier:     tier,
+					tierName: level.TierName,
+					members:  make([]string, 0),
+					labels: map[string]string{
+						api.NetworkTopologyProfileLabelKey: profile.labelValue,
+						level.NodeLabel:                    value,
+					},
+				}
+			}
+			if tier > 1 {
+				if existingParent, exists := parentByHyperNode[memberName]; exists && existingParent != hyperNodeName {
+					return hyperNodeInfoMap, fmt.Errorf("HyperNode %s in profile %s belongs to multiple parents: %s and %s", memberName, profile.name, existingParent, hyperNodeName)
+				}
+				parentByHyperNode[memberName] = hyperNodeName
+			}
+			hyperNodeInfo.members = append(hyperNodeInfo.members, memberName)
+			hyperNodeInfoMap[hyperNodeName] = hyperNodeInfo
+			memberName = hyperNodeName
 		}
 	}
 	return hyperNodeInfoMap, err
 }
 
-func (l *labelDiscoverer) buildHyperNodeName(topologyTypeName, key, value string, tier int, hyperNodeInfoMap map[string]HyperNodeInfo) (string, error) {
+func (l *labelDiscoverer) profileForNode(node *v1.Node) (*topologyProfile, error) {
+	var matched *topologyProfile
+	for i := range l.topologyProfiles {
+		profile := &l.topologyProfiles[i]
+		if !profile.nodeSelector.Matches(labels.Set(node.Labels)) {
+			continue
+		}
+		// Legacy profiles have no selector. Preserve their partial-level
+		// behavior while requiring at least the first topology label before
+		// treating the node as a profile member.
+		if !profile.selectorConfigured {
+			if len(profile.levels) == 0 {
+				continue
+			}
+			if _, exists := node.Labels[profile.levels[0].NodeLabel]; !exists {
+				continue
+			}
+		}
+		if matched != nil {
+			return nil, fmt.Errorf("node %s matches multiple topology profiles: %s and %s", node.Name, matched.name, profile.name)
+		}
+		matched = profile
+	}
+	return matched, nil
+}
+
+func (l *labelDiscoverer) buildHyperNodeName(profile topologyProfile, key, value string, tier int, hyperNodeInfoMap map[string]HyperNodeInfo) (string, error) {
 	list, err := l.hyperNodeLister.List(labels.SelectorFromSet(labels.Set{
 		key:                               value,
 		api.NetworkTopologySourceLabelKey: "label",
@@ -440,7 +606,7 @@ func (l *labelDiscoverer) buildHyperNodeName(topologyTypeName, key, value string
 		klog.Errorf("Failed to list existing hyperNode resources, error is %v", err.Error())
 		return "", err
 	}
-	topologyTypeName = cleanString(topologyTypeName)
+	topologyTypeName := cleanString(profile.name)
 	if len(list) > 0 {
 		targetName := fmt.Sprintf("hypernode-%s-tier%d", topologyTypeName, tier)
 		// To ensure deterministic behavior, sort by name before iterating.
@@ -448,28 +614,28 @@ func (l *labelDiscoverer) buildHyperNodeName(topologyTypeName, key, value string
 			return list[i].Name < list[j].Name
 		})
 		for _, hyperNode := range list {
+			if existingProfile, exists := hyperNode.Labels[api.NetworkTopologyProfileLabelKey]; exists && existingProfile != profile.labelValue {
+				continue
+			}
 			if strings.HasPrefix(hyperNode.Name, targetName) {
 				return hyperNode.Name, nil
 			}
 		}
 	}
-	for i := 0; i < loopCount; i++ {
-		randomSuffix := rand.String(5)
-		hyperNodeName := fmt.Sprintf("hypernode-%s-tier%d-%s", topologyTypeName, tier, randomSuffix)
-		_, err := l.hyperNodeLister.Get(hyperNodeName)
-		if err == nil {
-			continue
-		}
-		if !apierrors.IsNotFound(err) {
-			return "", err
-		}
-		_, exists := hyperNodeInfoMap[hyperNodeName]
-		if !exists {
-			return hyperNodeName, nil
-		}
+
+	domainHash := sha256.Sum256([]byte(profile.name + "\x00" + key + "\x00" + value))
+	hyperNodeName := fmt.Sprintf("hypernode-%s-tier%d-%x", topologyTypeName, tier, domainHash[:6])
+	_, err = l.hyperNodeLister.Get(hyperNodeName)
+	if err == nil {
+		return "", fmt.Errorf("deterministic HyperNode name %s is already used by a different topology domain", hyperNodeName)
 	}
-	klog.Errorf("unable to get unique hyperNodeName after %d attempts", loopCount)
-	return "", fmt.Errorf("unable to get unique hyperNodeName after %d attempts", loopCount)
+	if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+	if _, exists := hyperNodeInfoMap[hyperNodeName]; exists {
+		return "", fmt.Errorf("deterministic HyperNode name collision for %s", hyperNodeName)
+	}
+	return hyperNodeName, nil
 }
 
 func cleanString(s string) string {
@@ -505,13 +671,4 @@ func removeDuplicates(memberList []string) []string {
 		result = append(result, k)
 	}
 	return result
-}
-
-func getHyperNodeCached(labelHyperNodeMap map[string]map[string]string, key, value string) (string, bool) {
-	if valueMap, exists := labelHyperNodeMap[key]; exists {
-		if name, exists := valueMap[value]; exists {
-			return name, true
-		}
-	}
-	return "", false
 }
