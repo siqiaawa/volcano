@@ -27,6 +27,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/utils/set"
 
+	"volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/util"
@@ -291,12 +292,12 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 	})
 
 	ssn.AddHyperNodeGradientForJobFn(nta.Name(), func(job *api.JobInfo, hyperNode *api.HyperNodeInfo, purpose api.SearchPurpose) [][]*api.HyperNodeInfo {
-		if hardMode, highestAllowedTier := job.IsHardTopologyMode(); hardMode {
+		if topology := job.HardTopologyConstraint(); topology != nil {
 			jobMinResource := job.GetMinResources()
-			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, job.AllocatedHyperNode, jobMinResource, purpose)
+			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, topology, job.AllocatedHyperNode, jobMinResource, purpose)
 			if err != nil {
 				klog.ErrorS(err, "build hyperNode gradient fail", "job", job.UID, "hyperNode", hyperNode.Name,
-					"highestAllowedTier", highestAllowedTier, "allocatedHyperNode", job.AllocatedHyperNode)
+					"topology", topology, "allocatedHyperNode", job.AllocatedHyperNode)
 				return nil
 			}
 			if purpose != api.PurposeEvict {
@@ -308,12 +309,12 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 	})
 
 	ssn.AddHyperNodeGradientForSubJobFn(nta.Name(), func(subJob *api.SubJobInfo, hyperNode *api.HyperNodeInfo, purpose api.SearchPurpose) [][]*api.HyperNodeInfo {
-		if hardMode, highestAllowedTier := subJob.IsHardTopologyMode(); hardMode {
+		if topology := subJob.HardTopologyConstraint(); topology != nil {
 			subJobMinResource := subJob.GetMinResources()
-			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, subJob.AllocatedHyperNode, subJobMinResource, purpose)
+			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, topology, subJob.AllocatedHyperNode, subJobMinResource, purpose)
 			if err != nil {
 				klog.ErrorS(err, "build hyperNode gradient fail", "subJob", subJob.UID, "hyperNode", hyperNode.Name,
-					"highestAllowedTier", highestAllowedTier, "allocatedHyperNode", subJob.AllocatedHyperNode)
+					"topology", topology, "allocatedHyperNode", subJob.AllocatedHyperNode)
 				return nil
 			}
 			if purpose != api.PurposeEvict {
@@ -590,47 +591,140 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 
 // hyperNodeGradientFn computes network topology gradients by performing BFS traversal from the given HyperNode,
 // filtering and grouping HyperNodes by tier based on resource availability and topology constraints.
-// It returns HyperNodes organized in ascending tier order (lower tiers represent closer network proximity).
+// Each real tree is returned as a contiguous sequence of ascending local-tier gradients; real trees are ordered
+// by root name. A cluster-top numeric boundary retains the legacy cluster-wide tier grouping used by soft mode.
 //
 // Parameters:
 //   - ssn: scheduling session containing all HyperNode information and cluster state
 //   - hyperNode: starting HyperNode for the search, typically the root of available HyperNode subtree
-//   - highestAllowedTier: maximum allowed topology tier to limit search scope
+//   - topology: hard topology boundary expressed as either a numeric tier or a semantic tier name
 //   - allocatedHyperNode: previously allocated HyperNode name for partially running scenarios (empty for initial scheduling)
 //   - minResource: minimum resource requirements for resource pre-filtering (nil to skip resource checks)
 //   - purpose: indicates whether this gradient is used for allocation or eviction
-func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Session, hyperNode *api.HyperNodeInfo, highestAllowedTier int, allocatedHyperNode string, minResource *api.Resource, purpose api.SearchPurpose) ([][]*api.HyperNodeInfo, error) {
-	enqueued := set.New[string]()
-	var processQueue []*api.HyperNodeInfo
+func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Session, hyperNode *api.HyperNodeInfo, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string, minResource *api.Resource, purpose api.SearchPurpose) ([][]*api.HyperNodeInfo, error) {
+	if err := validateTopologyConstraint(topology); err != nil {
+		return nil, err
+	}
 
-	searchRoot, err := getSearchRoot(ssn.HyperNodes, hyperNode, highestAllowedTier, allocatedHyperNode)
+	searchRoot, err := getSearchRoot(ssn.HyperNodes, hyperNode, topology, allocatedHyperNode)
 	if err != nil {
 		return nil, fmt.Errorf("getSearchRoot failed: %w", err)
 	}
 
-	processQueue = append(processQueue, searchRoot)
+	// Soft topology is currently converted to a numeric hard constraint at
+	// ClusterTopHyperNode. Keep the existing cluster-wide tier grouping
+	// until soft topology gets its own tree-aware placement policy.
+	if searchRoot.Name == framework.ClusterTopHyperNode && topology.HighestTierAllowed != nil &&
+		*topology.HighestTierAllowed >= searchRoot.Tier() {
+		result, _, err := nta.hyperNodeGradientsForSubtree(
+			ssn, searchRoot, topology, allocatedHyperNode, minResource, purpose)
+		return result, err
+	}
+
+	ssn.EnsureTopologyTrees()
+
+	searchRoots := []*api.HyperNodeInfo{searchRoot}
+	if searchRoot.Name == framework.ClusterTopHyperNode {
+		searchRoots = searchRoots[:0]
+		for child := range searchRoot.Children {
+			if _, found := ssn.HyperNodes[child]; !found {
+				return nil, fmt.Errorf("child HyperNode %s of %s not found", child, searchRoot.Name)
+			}
+		}
+		roots := make([]string, 0, len(ssn.TopologyTrees))
+		for root := range ssn.TopologyTrees {
+			roots = append(roots, root)
+		}
+		sort.Strings(roots)
+		for _, root := range roots {
+			rootInfo, found := ssn.HyperNodes[root]
+			if !found {
+				return nil, fmt.Errorf("topology tree root HyperNode %s not found", root)
+			}
+			searchRoots = append(searchRoots, rootInfo)
+		}
+	}
+
+	matchedTierName := topology.HighestTierName == ""
+	var result [][]*api.HyperNodeInfo
+	for _, root := range searchRoots {
+		treeGradients, matched, err := nta.hyperNodeGradientsForSubtree(
+			ssn, root, topology, allocatedHyperNode, minResource, purpose)
+		if err != nil {
+			return nil, err
+		}
+		if matched {
+			matchedTierName = true
+		}
+		result = append(result, treeGradients...)
+	}
+
+	if topology.HighestTierName != "" && !matchedTierName {
+		return nil, fmt.Errorf("tier name %s not found in available HyperNode subtree %s", topology.HighestTierName, searchRoot.Name)
+	}
+	return result, nil
+}
+
+// hyperNodeGradientsForSubtree builds gradients for one search subtree. The
+// caller invokes it separately for each real tree in tree-aware hard mode.
+func (nta *networkTopologyAwarePlugin) hyperNodeGradientsForSubtree(ssn *framework.Session, searchRoot *api.HyperNodeInfo, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string, minResource *api.Resource, purpose api.SearchPurpose) ([][]*api.HyperNodeInfo, bool, error) {
+	enqueued := set.New[string]()
+
+	type searchItem struct {
+		hyperNode         *api.HyperNodeInfo
+		nameBoundaryFound bool
+	}
+
+	nameBoundaryFound := false
+	if topology.HighestTierName != "" {
+		var err error
+		nameBoundaryFound, err = hasUniqueTierNameOnAncestorChain(ssn.HyperNodes, searchRoot.Name, topology.HighestTierName)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	processQueue := []searchItem{{hyperNode: searchRoot, nameBoundaryFound: nameBoundaryFound}}
 	enqueued.Insert(searchRoot.Name)
+	matchedTierName := nameBoundaryFound
 
 	eligibleHyperNodes := make(map[int][]*api.HyperNodeInfo)
 	for len(processQueue) > 0 {
 		// pop one hyperNode from queue
-		current := processQueue[0]
+		item := processQueue[0]
 		processQueue = processQueue[1:]
+		current := item.hyperNode
 
-		if nta.isEligibleHyperNode(current, highestAllowedTier, allocatedHyperNode, minResource, purpose) {
+		withinBoundary := item.nameBoundaryFound
+		if topology.HighestTierAllowed != nil {
+			withinBoundary = current.Tier() <= *topology.HighestTierAllowed
+		}
+		if withinBoundary && nta.isEligibleHyperNode(current, allocatedHyperNode, minResource, purpose) {
 			eligibleHyperNodes[current.Tier()] = append(eligibleHyperNodes[current.Tier()], current)
 		}
 
 		// push children hyperNode into queue
-		for child := range current.Children {
+		children := current.Children.UnsortedList()
+		sort.Strings(children)
+		for _, child := range children {
 			if enqueued.Has(child) {
 				continue
 			}
-			processQueue = append(processQueue, ssn.HyperNodes[child])
+			childInfo, found := ssn.HyperNodes[child]
+			if !found {
+				return nil, false, fmt.Errorf("child HyperNode %s of %s not found", child, current.Name)
+			}
+			childBoundaryFound := item.nameBoundaryFound
+			if topology.HighestTierName != "" && childInfo.TierName() == topology.HighestTierName {
+				if childBoundaryFound {
+					return nil, false, fmt.Errorf("tier name %s appears more than once in the ancestor chain of HyperNode %s", topology.HighestTierName, child)
+				}
+				childBoundaryFound = true
+				matchedTierName = true
+			}
+			processQueue = append(processQueue, searchItem{hyperNode: childInfo, nameBoundaryFound: childBoundaryFound})
 			enqueued.Insert(child)
 		}
 	}
-
 	// organize hyperNode gradients by tiers in ascending order
 	var tiers []int
 	for tier := range eligibleHyperNodes {
@@ -640,17 +734,16 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 
 	var result [][]*api.HyperNodeInfo
 	for _, tier := range tiers {
+		sort.Slice(eligibleHyperNodes[tier], func(i, j int) bool {
+			return eligibleHyperNodes[tier][i].Name < eligibleHyperNodes[tier][j].Name
+		})
 		result = append(result, eligibleHyperNodes[tier])
 	}
 
-	return result, nil
+	return result, matchedTierName, nil
 }
 
-func (nta *networkTopologyAwarePlugin) isEligibleHyperNode(hn *api.HyperNodeInfo, highestAllowedTier int, allocatedHyperNode string, minResource *api.Resource, purpose api.SearchPurpose) bool {
-	if hn.Tier() > highestAllowedTier {
-		return false // the tier should not exceed the highest allowed
-	}
-
+func (nta *networkTopologyAwarePlugin) isEligibleHyperNode(hn *api.HyperNodeInfo, allocatedHyperNode string, minResource *api.Resource, purpose api.SearchPurpose) bool {
 	if allocatedHyperNode != "" {
 		return true // skip pre-filtering in partially running scenarios
 	}
@@ -674,12 +767,12 @@ func (nta *networkTopologyAwarePlugin) isEligibleHyperNode(hn *api.HyperNodeInfo
 // then **intersects** it with the HyperNode subtree constrained by the external caller(`hyperNodeAvailable`),
 // ensuring that the returned HyperNode subtree satisfies both the Job's(/SubJob's) network topology constraints
 // and the caller's constraints.
-func getSearchRoot(hyperNodes api.HyperNodeInfoMap, hyperNodeAvailable *api.HyperNodeInfo, highestAllowedTier int, allocatedHyperNode string) (*api.HyperNodeInfo, error) {
+func getSearchRoot(hyperNodes api.HyperNodeInfoMap, hyperNodeAvailable *api.HyperNodeInfo, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string) (*api.HyperNodeInfo, error) {
 	if allocatedHyperNode == "" {
 		return hyperNodeAvailable, nil
 	}
 
-	hyperNodeHighestAllowed, err := getHighestAllowedHyperNode(hyperNodes, highestAllowedTier, allocatedHyperNode)
+	hyperNodeHighestAllowed, err := getHighestAllowedHyperNode(hyperNodes, topology, allocatedHyperNode)
 	if err != nil {
 		return nil, fmt.Errorf("get highest allowed hyperNode failed: %w", err)
 	}
@@ -701,7 +794,33 @@ func getSearchRoot(hyperNodes api.HyperNodeInfoMap, hyperNodeAvailable *api.Hype
 		hyperNodeAvailable.Name, hyperNodeHighestAllowed)
 }
 
-func getHighestAllowedHyperNode(hyperNodes api.HyperNodeInfoMap, highestAllowedTier int, allocatedHyperNode string) (string, error) {
+func getHighestAllowedHyperNode(hyperNodes api.HyperNodeInfoMap, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string) (string, error) {
+	if err := validateTopologyConstraint(topology); err != nil {
+		return "", err
+	}
+
+	if topology.HighestTierName != "" {
+		var matched string
+		for _, ancestor := range hyperNodes.GetAncestors(allocatedHyperNode) {
+			hni, ok := hyperNodes[ancestor]
+			if !ok {
+				return "", fmt.Errorf("allocated HyperNode %s ancestor %s not found", allocatedHyperNode, ancestor)
+			}
+			if hni.TierName() != topology.HighestTierName {
+				continue
+			}
+			if matched != "" {
+				return "", fmt.Errorf("tier name %s appears more than once in the ancestor chain of allocated HyperNode %s", topology.HighestTierName, allocatedHyperNode)
+			}
+			matched = ancestor
+		}
+		if matched == "" {
+			return "", fmt.Errorf("allocated HyperNode %s has no ancestor with tier name %s", allocatedHyperNode, topology.HighestTierName)
+		}
+		return matched, nil
+	}
+
+	highestAllowedTier := *topology.HighestTierAllowed
 	var highestAllowedHyperNode string
 
 	ancestors := hyperNodes.GetAncestors(allocatedHyperNode)
@@ -721,6 +840,37 @@ func getHighestAllowedHyperNode(hyperNodes api.HyperNodeInfoMap, highestAllowedT
 	}
 
 	return highestAllowedHyperNode, nil
+}
+
+func validateTopologyConstraint(topology *scheduling.NetworkTopologySpec) error {
+	if topology == nil {
+		return fmt.Errorf("network topology constraint is nil")
+	}
+	if topology.HighestTierAllowed != nil && topology.HighestTierName != "" {
+		return fmt.Errorf("highestTierAllowed and highestTierName cannot be set simultaneously")
+	}
+	if topology.HighestTierAllowed == nil && topology.HighestTierName == "" {
+		return fmt.Errorf("network topology constraint has no tier boundary")
+	}
+	return nil
+}
+
+func hasUniqueTierNameOnAncestorChain(hyperNodes api.HyperNodeInfoMap, hyperNodeName, tierName string) (bool, error) {
+	matched := false
+	for _, ancestor := range hyperNodes.GetAncestors(hyperNodeName) {
+		hni, ok := hyperNodes[ancestor]
+		if !ok {
+			return false, fmt.Errorf("HyperNode %s ancestor %s not found", hyperNodeName, ancestor)
+		}
+		if hni.TierName() != tierName {
+			continue
+		}
+		if matched {
+			return false, fmt.Errorf("tier name %s appears more than once in the ancestor chain of HyperNode %s", tierName, hyperNodeName)
+		}
+		matched = true
+	}
+	return matched, nil
 }
 
 func (nta *networkTopologyAwarePlugin) OnSessionClose(ssn *framework.Session) {

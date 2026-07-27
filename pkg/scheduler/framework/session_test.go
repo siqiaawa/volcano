@@ -5,12 +5,56 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
+
+func TestSessionEnsureTopologyTrees(t *testing.T) {
+	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
+		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+		info.Children.Insert(children...)
+		return info
+	}
+
+	hyperNodes := api.HyperNodeInfoMap{
+		"a3-leaf":           newHyperNode("a3-leaf", 1),
+		"a3-root":           newHyperNode("a3-root", 2, "a3-leaf"),
+		"a5-leaf":           newHyperNode("a5-leaf", 1),
+		"a5-middle":         newHyperNode("a5-middle", 2, "a5-leaf"),
+		"a5-root":           newHyperNode("a5-root", 3, "a5-middle"),
+		ClusterTopHyperNode: newHyperNode(ClusterTopHyperNode, 4, "a3-root", "a5-root"),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+
+	ssn := &Session{
+		HyperNodes: hyperNodes,
+		RealNodesSet: map[string]sets.Set[string]{
+			"a3-root": sets.New("a3-node"),
+			"a5-root": sets.New("a5-node"),
+		},
+	}
+	ssn.EnsureTopologyTrees()
+
+	assert.Equal(t, sets.New("a3-root", "a5-root"), sets.KeySet(ssn.TopologyTrees))
+	assert.Equal(t, []int{1, 2}, ssn.TopologyTrees["a3-root"].Tiers)
+	assert.Equal(t, []int{1, 2, 3}, ssn.TopologyTrees["a5-root"].Tiers)
+	assert.Equal(t, sets.New("a3-root", "a3-leaf"), ssn.TopologyTrees["a3-root"].HyperNodes)
+	assert.Equal(t, sets.New("a5-root", "a5-middle", "a5-leaf"), ssn.TopologyTrees["a5-root"].HyperNodes)
+	assert.Equal(t, sets.New("a3-node"), ssn.TopologyTrees["a3-root"].RealNodes)
+	assert.Equal(t, sets.New("a5-node"), ssn.TopologyTrees["a5-root"].RealNodes)
+	assert.Equal(t, "a3-root", ssn.HyperNodeToTopologyTree["a3-leaf"])
+	assert.Equal(t, "a5-root", ssn.HyperNodeToTopologyTree["a5-middle"])
+	_, clusterRootIndexed := ssn.HyperNodeToTopologyTree[ClusterTopHyperNode]
+	assert.False(t, clusterRootIndexed)
+}
 
 func TestSession_adjustNetworkTopologySpec(t *testing.T) {
 	tests := []struct {
@@ -87,7 +131,7 @@ func TestSession_adjustNetworkTopologySpec(t *testing.T) {
 			},
 		},
 		{
-			name: "job with highestTierName, need translation",
+			name: "job with highestTierName is preserved for branch resolution",
 			jobs: map[api.JobID]*api.JobInfo{
 				"test-uid": {
 					PodGroup: &api.PodGroup{
@@ -128,14 +172,14 @@ func TestSession_adjustNetworkTopologySpec(t *testing.T) {
 						PodGroup: scheduling.PodGroup{
 							Spec: scheduling.PodGroupSpec{
 								NetworkTopology: &scheduling.NetworkTopologySpec{
-									HighestTierName:    "",
-									HighestTierAllowed: ptr.To(2),
+									HighestTierName:    "volcano.sh/hypercluster",
+									HighestTierAllowed: nil,
 								},
 								SubGroupPolicy: []scheduling.SubGroupPolicySpec{
 									{
 										NetworkTopology: &scheduling.NetworkTopologySpec{
-											HighestTierName:    "",
-											HighestTierAllowed: ptr.To(1),
+											HighestTierName:    "volcano.sh/hypernode",
+											HighestTierAllowed: nil,
 										},
 									},
 								},
@@ -145,8 +189,8 @@ func TestSession_adjustNetworkTopologySpec(t *testing.T) {
 					SubJobs: map[api.SubJobID]*api.SubJobInfo{
 						"test-uid": {
 							NetworkTopology: &scheduling.NetworkTopologySpec{
-								HighestTierName:    "",
-								HighestTierAllowed: ptr.To(1),
+								HighestTierName:    "volcano.sh/hypernode",
+								HighestTierAllowed: nil,
 							},
 						},
 					},
@@ -579,8 +623,8 @@ func TestConvertSoftToHardTopology_NilPodGroup(t *testing.T) {
 }
 
 func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
-	// This test verifies that adjustNetworkTopologySpec performs both tier name translation
-	// and soft→hard conversion in the same place.
+	// This test verifies that adjustNetworkTopologySpec converts soft mode while
+	// preserving hard tier names for branch-local resolution.
 	maxTier := 4 // ClusterTopHyperNode tier will be max(existing tiers) + 1 = 3 + 1 = 4
 
 	topHn := &topologyv1alpha1.HyperNode{}
@@ -594,9 +638,10 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 		hyperNodes  api.HyperNodeInfoMap
 		wantJobMode scheduling.NetworkTopologyMode
 		wantJobTier *int
+		wantJobName string
 	}{
 		{
-			name: "soft topology with tierName: both translated and converted",
+			name: "soft topology with tierName is converted to an unrestricted numeric boundary",
 			jobs: map[api.JobID]*api.JobInfo{
 				"test-uid": {
 					PodGroup: &api.PodGroup{
@@ -619,7 +664,6 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 			hyperNodes: api.HyperNodeInfoMap{
 				ClusterTopHyperNode: api.NewHyperNodeInfo(topHn),
 			},
-			// tierName is translated first (HighestTierAllowed=2), then soft→hard uses that tier
 			wantJobMode: scheduling.HardNetworkTopologyMode,
 			wantJobTier: ptr.To(maxTier),
 		},
@@ -647,7 +691,7 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 			wantJobTier: ptr.To(maxTier),
 		},
 		{
-			name: "hard topology with tierName: only translated, not re-converted",
+			name: "hard topology with tierName is preserved",
 			jobs: map[api.JobID]*api.JobInfo{
 				"test-uid": {
 					PodGroup: &api.PodGroup{
@@ -671,7 +715,8 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 				ClusterTopHyperNode: api.NewHyperNodeInfo(topHn),
 			},
 			wantJobMode: scheduling.HardNetworkTopologyMode,
-			wantJobTier: ptr.To(1), // translated from tierName, not overwritten by maxTier
+			wantJobTier: nil,
+			wantJobName: "volcano.sh/hypernode",
 		},
 	}
 
@@ -692,6 +737,7 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 			gotJob := ssn.Jobs["test-uid"]
 			assert.Equal(t, tt.wantJobMode, gotJob.NetworkTopology.Mode, "job mode mismatch")
 			assert.Equal(t, tt.wantJobTier, gotJob.NetworkTopology.HighestTierAllowed, "job tier mismatch")
+			assert.Equal(t, tt.wantJobName, gotJob.NetworkTopology.HighestTierName, "job tier name mismatch")
 		})
 	}
 }

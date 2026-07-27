@@ -55,6 +55,8 @@ type HyperNodesInfo struct {
 
 type HyperNodeInfoMap map[string]*HyperNodeInfo
 
+// HyperNodeTierNameMap is kept for compatibility and diagnostics. Scheduling
+// decisions must resolve tier names against each HyperNode branch instead.
 type HyperNodeTierNameMap map[string]int
 
 // NewHyperNodesInfo initializes a new HyperNodesInfo instance.
@@ -157,6 +159,11 @@ func (hni *HyperNodeInfo) String() string {
 // Tier returns the tier of the hypernode
 func (hni *HyperNodeInfo) Tier() int {
 	return hni.tier
+}
+
+// TierName returns the semantic tier name of the HyperNode.
+func (hni *HyperNodeInfo) TierName() string {
+	return hni.tierName
 }
 
 func (hni *HyperNodeInfo) DeepCopy() *HyperNodeInfo {
