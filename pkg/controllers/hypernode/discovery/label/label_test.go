@@ -911,6 +911,20 @@ func TestParseCfgRejectsUnsafeConfiguration(t *testing.T) {
 			},
 			errorContains: "node leaf level must not set tierName",
 		},
+		{
+			name: "invalid qualified node label",
+			config: map[string]interface{}{
+				"networkTopologyTypes": map[string]interface{}{
+					"topologyA3": map[string]interface{}{
+						"levels": []interface{}{
+							map[string]interface{}{"nodeLabel": "bad/key/extra", "tierName": "volcano.sh/hypernode"},
+							map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+						},
+					},
+				},
+			},
+			errorContains: "not a valid qualified name",
+		},
 	}
 
 	for _, tc := range tests {
@@ -918,6 +932,46 @@ func TestParseCfgRejectsUnsafeConfiguration(t *testing.T) {
 			_, _, err := parseCfg(api.DiscoveryConfig{Source: "label", Config: tc.config})
 			require.ErrorContains(t, err, tc.errorContains)
 		})
+	}
+}
+
+func TestLabelDiscovererStopIsIdempotentAndUnblocksOutput(t *testing.T) {
+	discoverer := NewLabelDiscoverer(getCfg(), fake.NewSimpleClientset(), vcclientset.NewSimpleClientset()).(*labelDiscoverer)
+	outputCh, err := discoverer.Start()
+	require.NoError(t, err)
+
+	stopped := make(chan error, 1)
+	go func() {
+		stopped <- discoverer.Stop()
+	}()
+	select {
+	case err := <-stopped:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Stop blocked while discovery output had no receiver")
+	}
+	require.NoError(t, discoverer.Stop())
+	_, open := <-outputCh
+	assert.False(t, open)
+}
+
+func TestLabelDiscovererResultSyncedReturnsAfterStop(t *testing.T) {
+	discoverer := &labelDiscoverer{
+		stopCh:      make(chan struct{}),
+		completedCh: make(chan struct{}),
+	}
+	close(discoverer.stopCh)
+
+	acknowledged := make(chan struct{})
+	go func() {
+		discoverer.ResultSynced()
+		close(acknowledged)
+	}()
+
+	select {
+	case <-acknowledged:
+	case <-time.After(time.Second):
+		t.Fatal("ResultSynced blocked after discoverer replacement")
 	}
 }
 

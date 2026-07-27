@@ -25,7 +25,6 @@ import (
 
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
-	"volcano.sh/apis/pkg/client/listers/topology/v1alpha1"
 )
 
 func CreateHyperNode(vcClient vcclientset.Interface, node *topologyv1alpha1.HyperNode) error {
@@ -39,15 +38,16 @@ func CreateHyperNode(vcClient vcclientset.Interface, node *topologyv1alpha1.Hype
 	})
 }
 
-func UpdateHyperNode(vcClient vcclientset.Interface, lister v1alpha1.HyperNodeLister, updated *topologyv1alpha1.HyperNode) error {
+func UpdateHyperNode(vcClient vcclientset.Interface, updated *topologyv1alpha1.HyperNode) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		current, err := lister.Get(updated.Name)
+		current, err := vcClient.TopologyV1alpha1().HyperNodes().Get(
+			context.Background(), updated.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
 
+		current = current.DeepCopy()
 		current.Spec = updated.Spec
-		current.Status = updated.Status
 
 		if current.Labels == nil {
 			current.Labels = make(map[string]string)
@@ -63,10 +63,11 @@ func UpdateHyperNode(vcClient vcclientset.Interface, lister v1alpha1.HyperNodeLi
 			current.Annotations[k] = v
 		}
 
-		_, err = vcClient.TopologyV1alpha1().HyperNodes().Update(context.Background(), current, metav1.UpdateOptions{})
+		current, err = vcClient.TopologyV1alpha1().HyperNodes().Update(context.Background(), current, metav1.UpdateOptions{})
 		if err != nil {
 			return err
 		}
+		current.Status = updated.Status
 		_, err = vcClient.TopologyV1alpha1().HyperNodes().UpdateStatus(context.Background(), current, metav1.UpdateOptions{})
 		return err
 	})

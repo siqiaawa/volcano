@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -106,6 +107,8 @@ type labelDiscoverer struct {
 	completedCh          chan struct{}
 	queue                workqueue.TypedRateLimitingInterface[string]
 	hyperNodeLister      topologylisterv1alpha1.HyperNodeLister
+	stopOnce             sync.Once
+	workerWG             sync.WaitGroup
 }
 
 // Start begins the topology discovery process and returns the channel for receiving discovered topology
@@ -140,23 +143,33 @@ func (l *labelDiscoverer) Start() (chan []*topologyv1alpha1.HyperNode, error) {
 
 	l.enqueue()
 
-	// Start discovery in a separate goroutine
-	go l.work()
+	// Start discovery in a separate goroutine.
+	l.workerWG.Add(1)
+	go func() {
+		defer l.workerWG.Done()
+		defer close(l.outputCh)
+		l.work()
+	}()
 
 	return l.outputCh, nil
 }
 
 // Stop halts the discovery process
 func (l *labelDiscoverer) Stop() error {
-	close(l.outputCh)
-	close(l.stopCh)
-	l.queue.ShutDown()
+	l.stopOnce.Do(func() {
+		close(l.stopCh)
+		l.queue.ShutDown()
+	})
+	l.workerWG.Wait()
 	return nil
 }
 
 // ResultSynced notice the topology discovery results have been processed
 func (l *labelDiscoverer) ResultSynced() {
-	l.completedCh <- struct{}{}
+	select {
+	case l.completedCh <- struct{}{}:
+	case <-l.stopCh:
+	}
 }
 
 // Name returns the discoverer name
@@ -323,6 +336,9 @@ func checkLabels(labels []NodeLabel) error {
 		if label.NodeLabel == "" {
 			return errors.New("nodeLabel cannot be empty")
 		}
+		if validationErrors := validation.IsQualifiedName(label.NodeLabel); len(validationErrors) > 0 {
+			return fmt.Errorf("nodeLabel %q is not a valid qualified name: %s", label.NodeLabel, strings.Join(validationErrors, "; "))
+		}
 		if _, exist := seen[label.NodeLabel]; !exist {
 			seen[label.NodeLabel] = true
 			continue
@@ -380,8 +396,12 @@ func (l *labelDiscoverer) discovery() error {
 	// create HyperNodes
 	hyperNodes := l.buildHyperNodes(hyperNodeInfoMap)
 
-	// Send discovered nodes through the channel
-	l.outputCh <- hyperNodes
+	// Send discovered nodes through the channel unless shutdown has started.
+	select {
+	case l.outputCh <- hyperNodes:
+	case <-l.stopCh:
+		return nil
+	}
 
 	klog.InfoS("End label based hyperNode auto discovery")
 	return err
