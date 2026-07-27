@@ -484,33 +484,89 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNormalPods(ssn *framew
 		return nodeScores, nil
 	}
 
-	totalTierWeight := 0.0
-	tierWeights := make(map[int]float64)
+	// Keep the global weights for malformed topologies where one Node belongs
+	// to multiple real trees. Valid topologies are scored by their local tree
+	// depth below, so tiers that only exist in a sibling tree cannot add score.
+	globalTierWeight := 0.0
+	globalTierWeights := make(map[int]float64)
 	for tier := nta.hyperNodesTier.minTier; tier <= nta.hyperNodesTier.maxTier; tier++ {
 		// Note: math.Pow(0, 0) = 1
 		tierWeight := math.Pow(nta.hyperNodeBinPackingFading, float64(tier-1))
-		totalTierWeight += tierWeight
-		tierWeights[tier] = tierWeight
+		globalTierWeight += tierWeight
+		globalTierWeights[tier] = tierWeight
 	}
-	if totalTierWeight <= 0 {
+	if globalTierWeight <= 0 {
 		// This should not happen, since there are at least one tier and its weight is one
-		klog.Warningf("the total tier weight of plugin %s should be greater than zero, but got %g", PluginName, totalTierWeight)
+		klog.Warningf("the total tier weight of plugin %s should be greater than zero, but got %g", PluginName, globalTierWeight)
 		return nodeScores, nil
 	}
 
-	for _, node := range nodes {
+	ssn.EnsureTopologyTrees()
+	nodeTopologyTrees := make(map[string]*framework.TopologyTree)
+	ambiguousNodes := set.New[string]()
+	for _, tree := range ssn.TopologyTrees {
+		for nodeName := range tree.RealNodes {
+			if previous, found := nodeTopologyTrees[nodeName]; found && previous.Root != tree.Root {
+				ambiguousNodes.Insert(nodeName)
+				continue
+			}
+			nodeTopologyTrees[nodeName] = tree
+		}
+	}
+
+	globalScore := func(nodeName string) float64 {
 		totalScore := 0.0
 		for tier := nta.hyperNodesTier.minTier; tier <= nta.hyperNodesTier.maxTier; tier++ {
-			// If no hypernode is found at this tier, this tierScore is FullScore finally, because we prefer to schedule pods to nodes that do not belong to any hypernode.
 			tierScore := FullScore
 			for hyperNodeName := range ssn.HyperNodesSetByTier[tier] {
+				if ssn.RealNodesSet[hyperNodeName].Has(nodeName) {
+					tierScore = nta.getPodHyperNodeBinPackingScore(task, hyperNodeName)
+					break
+				}
+			}
+			totalScore += globalTierWeights[tier] * tierScore
+		}
+		return totalScore / globalTierWeight
+	}
+
+	for _, node := range nodes {
+		tree, found := nodeTopologyTrees[node.Name]
+		if !found {
+			// Preserve the preference for Nodes outside any HyperNode topology.
+			nodeScores[node.Name] = FullScore
+			continue
+		}
+		if ambiguousNodes.Has(node.Name) {
+			nodeScores[node.Name] = globalScore(node.Name)
+			continue
+		}
+
+		totalScore := 0.0
+		totalTierWeight := 0.0
+		for localTier, tier := range tree.Tiers {
+			tierWeight := math.Pow(nta.hyperNodeBinPackingFading, float64(localTier))
+			totalTierWeight += tierWeight
+			// If no hypernode is found at this tier, this tierScore is FullScore finally, because we prefer to schedule pods to nodes that do not belong to any hypernode.
+			tierScore := FullScore
+			for hyperNodeName := range tree.ByTier[tier] {
 				if ssn.RealNodesSet[hyperNodeName].Has(node.Name) {
 					tierScore = nta.getPodHyperNodeBinPackingScore(task, hyperNodeName)
 					break
 				}
 			}
-			totalScore += tierWeights[tier] * tierScore
+			totalScore += tierWeight * tierScore
 		}
+
+		if _, hasClusterRoot := ssn.HyperNodes[framework.ClusterTopHyperNode]; hasClusterRoot {
+			rootWeight := math.Pow(nta.hyperNodeBinPackingFading, float64(len(tree.Tiers)))
+			totalTierWeight += rootWeight
+			rootScore := FullScore
+			if ssn.RealNodesSet[framework.ClusterTopHyperNode].Has(node.Name) {
+				rootScore = nta.getPodHyperNodeBinPackingScore(task, framework.ClusterTopHyperNode)
+			}
+			totalScore += rootWeight * rootScore
+		}
+
 		nodeScores[node.Name] = totalScore / totalTierWeight
 	}
 	return nodeScores, nil
@@ -568,8 +624,8 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 	var maxScore float64 = -1
 	scoreToNodes := map[float64][]string{}
 	for _, node := range nodes {
-		hyperNode := util.FindHyperNodeForNode(node.Name, ssn.RealNodesList, ssn.HyperNodesTiers, ssn.HyperNodesSetByTier)
-		score := nta.networkTopologyAwareScore(hyperNode, allocatedHyperNode, ssn.HyperNodes)
+		hyperNode := ssn.FindHyperNodeForNode(node.Name)
+		score := nta.networkTopologyAwareScore(hyperNode, allocatedHyperNode, ssn)
 		nodeScores[node.Name] = score
 		if score >= maxScore {
 			maxScore = score
@@ -580,7 +636,7 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 	if len(scoreToNodes[maxScore]) > 1 {
 		candidateNodes := scoreToNodes[maxScore]
 		for _, node := range candidateNodes {
-			hyperNode := util.FindHyperNodeForNode(node, ssn.RealNodesList, ssn.HyperNodesTiers, ssn.HyperNodesSetByTier)
+			hyperNode := ssn.FindHyperNodeForNode(node)
 			taskNumScore := nta.scoreWithTaskNum(hyperNode, subJob.Tasks, ssn.RealNodesList)
 			nodeScores[node] += taskNumScore
 		}
@@ -907,20 +963,33 @@ func (nta *networkTopologyAwarePlugin) reverseAndCapEvictionGradients(gradients 
 
 // Goals:
 // - The tier of LCAHyperNode of the hyperNode and the job allocatedHyperNode should be as low as possible.
-func (nta *networkTopologyAwarePlugin) networkTopologyAwareScore(hyperNodeName, jobAllocatedHyperNode string, hyperNodeMap api.HyperNodeInfoMap) float64 {
+func (nta *networkTopologyAwarePlugin) networkTopologyAwareScore(hyperNodeName, jobAllocatedHyperNode string, ssn *framework.Session) float64 {
 	if hyperNodeName == "" || jobAllocatedHyperNode == "" {
 		return ZeroScore
 	}
 	if hyperNodeName == jobAllocatedHyperNode {
 		return FullScore
 	}
+	hyperNodeMap := ssn.HyperNodes
 	LCAHyperNode := hyperNodeMap.GetLCAHyperNode(hyperNodeName, jobAllocatedHyperNode)
 	hyperNodeInfo, ok := hyperNodeMap[LCAHyperNode]
 	if !ok {
 		return ZeroScore
 	}
+
+	minTier, maxTier := nta.minTier, nta.maxTier
+	ssn.EnsureTopologyTrees()
+	if root, found := ssn.HyperNodeToTopologyTree[jobAllocatedHyperNode]; found {
+		if tree, found := ssn.TopologyTrees[root]; found && len(tree.Tiers) > 0 {
+			minTier = tree.Tiers[0]
+			// Use a virtual boundary immediately above this real root. This
+			// preserves the legacy single-tree scale without allowing a deeper
+			// sibling tree to inflate scores in a shallower tree.
+			maxTier = tree.Tiers[len(tree.Tiers)-1] + 1
+		}
+	}
 	// Calculate score: (maxTier - LCAhyperNode.tier)/(maxTier - minTier)
-	hyperNodeTierScore := nta.scoreHyperNodeWithTier(hyperNodeInfo.Tier())
+	hyperNodeTierScore := scoreHyperNodeWithTierRange(hyperNodeInfo.Tier(), minTier, maxTier)
 	return hyperNodeTierScore
 }
 
@@ -936,13 +1005,13 @@ func (nta *networkTopologyAwarePlugin) scoreWithTaskNum(hyperNodeName string, ta
 	return taskNumScore
 }
 
-func (nta *networkTopologyAwarePlugin) scoreHyperNodeWithTier(tier int) float64 {
+func scoreHyperNodeWithTierRange(tier, minTier, maxTier int) float64 {
 	// Use tier to calculate scores and map the original score to the range between 0 and 1.
-	if nta.minTier == nta.maxTier {
+	if minTier == maxTier {
 		return FullScore
 	}
-	if nta.minTier <= tier && tier <= nta.maxTier {
-		return float64(nta.maxTier-tier) / float64(nta.maxTier-nta.minTier)
+	if minTier <= tier && tier <= maxTier {
+		return float64(maxTier-tier) / float64(maxTier-minTier)
 	}
 	return ZeroScore
 }

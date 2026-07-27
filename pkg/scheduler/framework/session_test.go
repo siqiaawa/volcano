@@ -37,8 +37,11 @@ func TestSessionEnsureTopologyTrees(t *testing.T) {
 	ssn := &Session{
 		HyperNodes: hyperNodes,
 		RealNodesSet: map[string]sets.Set[string]{
-			"a3-root": sets.New("a3-node"),
-			"a5-root": sets.New("a5-node"),
+			"a3-leaf":   sets.New("a3-node"),
+			"a3-root":   sets.New("a3-node"),
+			"a5-leaf":   sets.New("a5-node"),
+			"a5-middle": sets.New("a5-node"),
+			"a5-root":   sets.New("a5-node"),
 		},
 	}
 	ssn.EnsureTopologyTrees()
@@ -54,6 +57,9 @@ func TestSessionEnsureTopologyTrees(t *testing.T) {
 	assert.Equal(t, "a5-root", ssn.HyperNodeToTopologyTree["a5-middle"])
 	_, clusterRootIndexed := ssn.HyperNodeToTopologyTree[ClusterTopHyperNode]
 	assert.False(t, clusterRootIndexed)
+	assert.Equal(t, "a3-leaf", ssn.FindHyperNodeForNode("a3-node"))
+	assert.Equal(t, "a5-leaf", ssn.FindHyperNodeForNode("a5-node"))
+	assert.Empty(t, ssn.FindHyperNodeForNode("outside-node"))
 }
 
 func TestSession_adjustNetworkTopologySpec(t *testing.T) {
