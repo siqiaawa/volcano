@@ -26,12 +26,13 @@ func TestSessionEnsureTopologyTrees(t *testing.T) {
 	}
 
 	hyperNodes := api.HyperNodeInfoMap{
-		"a3-leaf":           newHyperNode("a3-leaf", 1),
-		"a3-root":           newHyperNode("a3-root", 2, "a3-leaf"),
-		"a5-leaf":           newHyperNode("a5-leaf", 1),
-		"a5-middle":         newHyperNode("a5-middle", 2, "a5-leaf"),
-		"a5-root":           newHyperNode("a5-root", 3, "a5-middle"),
-		ClusterTopHyperNode: newHyperNode(ClusterTopHyperNode, 4, "a3-root", "a5-root"),
+		"shallow-leaf":      newHyperNode("shallow-leaf", 1),
+		"shallow-root":      newHyperNode("shallow-root", 2, "shallow-leaf"),
+		"deep-leaf":         newHyperNode("deep-leaf", 1),
+		"deep-middle":       newHyperNode("deep-middle", 2, "deep-leaf"),
+		"deep-root":         newHyperNode("deep-root", 3, "deep-middle"),
+		"single-tier":       newHyperNode("single-tier", 1),
+		ClusterTopHyperNode: newHyperNode(ClusterTopHyperNode, 4, "shallow-root", "deep-root", "single-tier"),
 	}
 	for _, parent := range hyperNodes {
 		for child := range parent.Children {
@@ -42,28 +43,34 @@ func TestSessionEnsureTopologyTrees(t *testing.T) {
 	ssn := &Session{
 		HyperNodes: hyperNodes,
 		RealNodesSet: map[string]sets.Set[string]{
-			"a3-leaf":   sets.New("a3-node"),
-			"a3-root":   sets.New("a3-node"),
-			"a5-leaf":   sets.New("a5-node"),
-			"a5-middle": sets.New("a5-node"),
-			"a5-root":   sets.New("a5-node"),
+			"shallow-leaf": sets.New("shallow-node"),
+			"shallow-root": sets.New("shallow-node"),
+			"deep-leaf":    sets.New("deep-node"),
+			"deep-middle":  sets.New("deep-node"),
+			"deep-root":    sets.New("deep-node"),
+			"single-tier":  sets.New("single-tier-node"),
 		},
 	}
 	ssn.EnsureTopologyTrees()
 
-	assert.Equal(t, sets.New("a3-root", "a5-root"), sets.KeySet(ssn.TopologyTrees))
-	assert.Equal(t, []int{1, 2}, ssn.TopologyTrees["a3-root"].Tiers)
-	assert.Equal(t, []int{1, 2, 3}, ssn.TopologyTrees["a5-root"].Tiers)
-	assert.Equal(t, sets.New("a3-root", "a3-leaf"), ssn.TopologyTrees["a3-root"].HyperNodes)
-	assert.Equal(t, sets.New("a5-root", "a5-middle", "a5-leaf"), ssn.TopologyTrees["a5-root"].HyperNodes)
-	assert.Equal(t, sets.New("a3-node"), ssn.TopologyTrees["a3-root"].RealNodes)
-	assert.Equal(t, sets.New("a5-node"), ssn.TopologyTrees["a5-root"].RealNodes)
-	assert.Equal(t, "a3-root", ssn.HyperNodeToTopologyTree["a3-leaf"])
-	assert.Equal(t, "a5-root", ssn.HyperNodeToTopologyTree["a5-middle"])
+	assert.Equal(t, sets.New("shallow-root", "deep-root", "single-tier"), sets.KeySet(ssn.TopologyTrees))
+	assert.Equal(t, []int{1, 2}, ssn.TopologyTrees["shallow-root"].Tiers)
+	assert.Equal(t, []int{1, 2, 3}, ssn.TopologyTrees["deep-root"].Tiers)
+	assert.Equal(t, []int{1}, ssn.TopologyTrees["single-tier"].Tiers)
+	assert.Equal(t, sets.New("shallow-root", "shallow-leaf"), ssn.TopologyTrees["shallow-root"].HyperNodes)
+	assert.Equal(t, sets.New("deep-root", "deep-middle", "deep-leaf"), ssn.TopologyTrees["deep-root"].HyperNodes)
+	assert.Equal(t, sets.New("single-tier"), ssn.TopologyTrees["single-tier"].HyperNodes)
+	assert.Equal(t, sets.New("shallow-node"), ssn.TopologyTrees["shallow-root"].RealNodes)
+	assert.Equal(t, sets.New("deep-node"), ssn.TopologyTrees["deep-root"].RealNodes)
+	assert.Equal(t, sets.New("single-tier-node"), ssn.TopologyTrees["single-tier"].RealNodes)
+	assert.Equal(t, "shallow-root", ssn.HyperNodeToTopologyTree["shallow-leaf"])
+	assert.Equal(t, "deep-root", ssn.HyperNodeToTopologyTree["deep-middle"])
+	assert.Equal(t, "single-tier", ssn.HyperNodeToTopologyTree["single-tier"])
 	_, clusterRootIndexed := ssn.HyperNodeToTopologyTree[ClusterTopHyperNode]
 	assert.False(t, clusterRootIndexed)
-	assert.Equal(t, "a3-leaf", ssn.FindHyperNodeForNode("a3-node"))
-	assert.Equal(t, "a5-leaf", ssn.FindHyperNodeForNode("a5-node"))
+	assert.Equal(t, "shallow-leaf", ssn.FindHyperNodeForNode("shallow-node"))
+	assert.Equal(t, "deep-leaf", ssn.FindHyperNodeForNode("deep-node"))
+	assert.Equal(t, "single-tier", ssn.FindHyperNodeForNode("single-tier-node"))
 	assert.Empty(t, ssn.FindHyperNodeForNode("outside-node"))
 }
 
@@ -75,17 +82,17 @@ func TestSessionRecoverAllocatedHyperNodeAcrossMixedTopology(t *testing.T) {
 	}
 
 	hyperNodes := api.HyperNodeInfoMap{
-		"a3-hypernode-0": newHyperNode("a3-hypernode-0", 1),
-		"a3-hypernode-1": newHyperNode("a3-hypernode-1", 1),
-		"a3-hypercluster": newHyperNode(
-			"a3-hypercluster", 2, "a3-hypernode-0", "a3-hypernode-1"),
-		"a5-superpod-0": newHyperNode("a5-superpod-0", 1),
-		"a5-superpod-1": newHyperNode("a5-superpod-1", 1),
-		"a5-hypernode": newHyperNode(
-			"a5-hypernode", 2, "a5-superpod-0", "a5-superpod-1"),
-		"a5-hypercluster": newHyperNode("a5-hypercluster", 3, "a5-hypernode"),
+		"shallow-hypernode-0": newHyperNode("shallow-hypernode-0", 1),
+		"shallow-hypernode-1": newHyperNode("shallow-hypernode-1", 1),
+		"shallow-hypercluster": newHyperNode(
+			"shallow-hypercluster", 2, "shallow-hypernode-0", "shallow-hypernode-1"),
+		"deep-superpod-0": newHyperNode("deep-superpod-0", 1),
+		"deep-superpod-1": newHyperNode("deep-superpod-1", 1),
+		"deep-hypernode": newHyperNode(
+			"deep-hypernode", 2, "deep-superpod-0", "deep-superpod-1"),
+		"deep-hypercluster": newHyperNode("deep-hypercluster", 3, "deep-hypernode"),
 		ClusterTopHyperNode: newHyperNode(
-			ClusterTopHyperNode, 4, "a3-hypercluster", "a5-hypercluster"),
+			ClusterTopHyperNode, 4, "shallow-hypercluster", "deep-hypercluster"),
 	}
 	for _, parent := range hyperNodes {
 		for child := range parent.Children {
@@ -94,19 +101,19 @@ func TestSessionRecoverAllocatedHyperNodeAcrossMixedTopology(t *testing.T) {
 	}
 
 	realNodes := map[string]sets.Set[string]{
-		"a3-hypernode-0": sets.New("a3-node-0", "a3-node-1"),
-		"a3-hypernode-1": sets.New("a3-node-2", "a3-node-3"),
-		"a3-hypercluster": sets.New(
-			"a3-node-0", "a3-node-1", "a3-node-2", "a3-node-3"),
-		"a5-superpod-0": sets.New("a5-node-0", "a5-node-1"),
-		"a5-superpod-1": sets.New("a5-node-2", "a5-node-3"),
-		"a5-hypernode": sets.New(
-			"a5-node-0", "a5-node-1", "a5-node-2", "a5-node-3"),
-		"a5-hypercluster": sets.New(
-			"a5-node-0", "a5-node-1", "a5-node-2", "a5-node-3"),
+		"shallow-hypernode-0": sets.New("shallow-node-0", "shallow-node-1"),
+		"shallow-hypernode-1": sets.New("shallow-node-2", "shallow-node-3"),
+		"shallow-hypercluster": sets.New(
+			"shallow-node-0", "shallow-node-1", "shallow-node-2", "shallow-node-3"),
+		"deep-superpod-0": sets.New("deep-node-0", "deep-node-1"),
+		"deep-superpod-1": sets.New("deep-node-2", "deep-node-3"),
+		"deep-hypernode": sets.New(
+			"deep-node-0", "deep-node-1", "deep-node-2", "deep-node-3"),
+		"deep-hypercluster": sets.New(
+			"deep-node-0", "deep-node-1", "deep-node-2", "deep-node-3"),
 		ClusterTopHyperNode: sets.New(
-			"a3-node-0", "a3-node-1", "a3-node-2", "a3-node-3",
-			"a5-node-0", "a5-node-1", "a5-node-2", "a5-node-3"),
+			"shallow-node-0", "shallow-node-1", "shallow-node-2", "shallow-node-3",
+			"deep-node-0", "deep-node-1", "deep-node-2", "deep-node-3"),
 	}
 
 	const (
@@ -143,8 +150,8 @@ func TestSessionRecoverAllocatedHyperNodeAcrossMixedTopology(t *testing.T) {
 	}})
 
 	for partition, nodes := range [][]string{
-		{"a5-node-0", "a5-node-1"},
-		{"a5-node-2", "a5-node-3"},
+		{"deep-node-0", "deep-node-1"},
+		{"deep-node-2", "deep-node-3"},
 	} {
 		for index, nodeName := range nodes {
 			podName := fmt.Sprintf("worker-%d-%d", partition, index)
@@ -171,11 +178,11 @@ func TestSessionRecoverAllocatedHyperNodeAcrossMixedTopology(t *testing.T) {
 	ssn := &Session{DirtyJobs: sets.New[api.JobID]()}
 	ssn.recoverAllocatedHyperNode(job, sets.KeySet(hyperNodes), hyperNodes, realNodes)
 
-	assert.Equal(t, "a5-hypernode", job.AllocatedHyperNode)
+	assert.Equal(t, "deep-hypernode", job.AllocatedHyperNode)
 	assert.Len(t, job.SubJobs, 2)
 	expectedSubGroupHyperNodes := map[int]string{
-		0: "a5-superpod-0",
-		1: "a5-superpod-1",
+		0: "deep-superpod-0",
+		1: "deep-superpod-1",
 	}
 	for _, subJob := range job.SubJobs {
 		assert.Equal(t, expectedSubGroupHyperNodes[subJob.MatchIndex], subJob.AllocatedHyperNode)

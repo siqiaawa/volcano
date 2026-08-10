@@ -38,13 +38,15 @@ import (
 )
 
 const (
-	mixedProfileLabel       = "volcano.sh/e2e-topology-profile"
-	mixedA3HyperNodeLabel   = "volcano.sh/e2e-a3-hypernode"
-	mixedA5SuperPodLabel    = "volcano.sh/e2e-a5-superpod"
-	mixedA5HyperNodeLabel   = "volcano.sh/e2e-a5-hypernode"
-	mixedClusterLabel       = "volcano.sh/e2e-hypercluster"
-	mixedTopologySourceKey  = "volcano.sh/network-topology-source"
-	mixedTopologyProfileKey = "volcano.sh/network-topology-profile"
+	mixedProfileLabel        = "volcano.sh/e2e-topology-profile"
+	mixedShallowDomainLabel  = "volcano.sh/e2e-shallow-domain"
+	mixedCompactClusterLabel = "volcano.sh/e2e-compact-hypercluster"
+	mixedWideHyperNodeLabel  = "volcano.sh/e2e-wide-hypernode"
+	mixedDeepSuperPodLabel   = "volcano.sh/e2e-deep-superpod"
+	mixedDeepHyperNodeLabel  = "volcano.sh/e2e-deep-hypernode"
+	mixedClusterLabel        = "volcano.sh/e2e-hypercluster"
+	mixedTopologySourceKey   = "volcano.sh/network-topology-source"
+	mixedTopologyProfileKey  = "volcano.sh/network-topology-profile"
 )
 
 type mixedTopologyHyperNodeSnapshot struct {
@@ -59,7 +61,7 @@ var mixedTopologyTolerations = []v1.Toleration{{
 	Effect:   v1.TaintEffectNoSchedule,
 }}
 
-var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
+var _ = Describe("Mixed shallow and deep topology", Serial, func() {
 	var testCtx *e2eutil.TestContext
 
 	BeforeEach(func() {
@@ -83,25 +85,25 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		}()
 
 		validConfig := mixedTopologyDiscoveryConfig()
-		By("enabling A3 and A5 label discovery profiles")
+		By("enabling single-tier shallow and three-tier deep label discovery profiles")
 		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, validConfig)).To(Succeed())
 		Eventually(func() (bool, error) {
-			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
+			return mixedTopologyHasExpectedTiers(testCtx, 6, "", 2)
 		}, 60*time.Second, time.Second).Should(BeTrue())
 		Eventually(func() (bool, error) {
 			return mixedTopologyHasExpectedGraph(testCtx)
 		}, 60*time.Second, time.Second).Should(BeTrue(),
-			"A3 and A5 should remain separate complete trees even when their roots share one label key/value")
-		a5Snapshot, err := mixedTopologyProfileSnapshot(testCtx, "topologya5")
+			"shallow and deep should remain separate complete trees even when their roots share one label key/value")
+		deepSnapshot, err := mixedTopologyProfileSnapshot(testCtx, "topologydeep")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(a5Snapshot).To(HaveLen(4))
+		Expect(deepSnapshot).To(HaveLen(4))
 
-		By("scheduling a job whose semantic hypernode tier is tier 1 in A3 and tier 2 in A5")
+		By("scheduling a job whose semantic hypercluster tier is tier 1 in shallow and tier 3 in deep")
 		job := e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
 			Name: "mixed-tier-name-job",
 			NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
 				Mode:            batchv1alpha1.HardNetworkTopologyMode,
-				HighestTierName: "volcano.sh/hypernode",
+				HighestTierName: "volcano.sh/hypercluster",
 			},
 			Tasks: []e2eutil.TaskSpec{{
 				Name:        "worker",
@@ -122,54 +124,54 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 			"tierName: volcano.sh/hypernode", "tierNmae: volcano.sh/hypernode", 1)
 		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, invalidConfig)).To(Succeed())
 		Consistently(func() (bool, error) {
-			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
+			return mixedTopologyHasExpectedTiers(testCtx, 6, "", 2)
 		}, 2*time.Second, 200*time.Millisecond).Should(BeTrue())
 
 		By("changing a Node while the replacement config is invalid")
-		Expect(setNodeLabel(testCtx.Kubeclient, "kwok-node-0", mixedA3HyperNodeLabel, "hn-a3-new")).To(Succeed())
+		Expect(setNodeLabel(testCtx.Kubeclient, "kwok-node-0", mixedShallowDomainLabel, "hn-shallow-new")).To(Succeed())
 		Eventually(func() (bool, error) {
-			return mixedTopologyHasExpectedTiers(testCtx, 8, "hn-a3-new")
+			return mixedTopologyHasExpectedTiers(testCtx, 7, "hn-shallow-new", 3)
 		}, 60*time.Second, time.Second).Should(BeTrue(), "the old discoverer should remain active")
-		currentA5, err := mixedTopologyProfileSnapshot(testCtx, "topologya5")
+		currentDeep, err := mixedTopologyProfileSnapshot(testCtx, "topologydeep")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(currentA5).To(Equal(a5Snapshot), "an A3-only domain change must not recreate or mutate A5")
+		Expect(currentDeep).To(Equal(deepSnapshot), "a shallow-only domain change must not recreate or mutate deep")
 
 		By("restoring the valid config and verifying the replacement discoverer converges")
 		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, validConfig)).To(Succeed())
-		Expect(setNodeLabel(testCtx.Kubeclient, "kwok-node-0", mixedA3HyperNodeLabel, "hn-a3-0")).To(Succeed())
+		Expect(setNodeLabel(testCtx.Kubeclient, "kwok-node-0", mixedShallowDomainLabel, "hn-shallow-0")).To(Succeed())
 		Eventually(func() (bool, error) {
-			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
+			return mixedTopologyHasExpectedTiers(testCtx, 6, "", 2)
 		}, 60*time.Second, time.Second).Should(BeTrue())
 		Eventually(func() (bool, error) {
 			return mixedTopologyHasExpectedGraph(testCtx)
 		}, 60*time.Second, time.Second).Should(BeTrue())
-		currentA5, err = mixedTopologyProfileSnapshot(testCtx, "topologya5")
+		currentDeep, err = mixedTopologyProfileSnapshot(testCtx, "topologydeep")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(currentA5).To(Equal(a5Snapshot), "restoring A3 must preserve the independent A5 tree")
+		Expect(currentDeep).To(Equal(deepSnapshot), "restoring shallow must preserve the independent deep tree")
 
-		By("removing every A3 Node from its profile without changing A5")
+		By("removing every shallow Node from its profile without changing deep")
 		for i := 0; i < 4; i++ {
 			Expect(setNodeLabel(testCtx.Kubeclient, fmt.Sprintf("kwok-node-%d", i), mixedProfileLabel, "disabled")).To(Succeed())
 		}
 		Eventually(func() (bool, error) {
-			a3Snapshot, err := mixedTopologyProfileSnapshot(testCtx, "topologya3")
-			return len(a3Snapshot) == 0, err
-		}, 60*time.Second, time.Second).Should(BeTrue(), "all A3 HyperNodes should be deleted")
+			shallowSnapshot, err := mixedTopologyProfileSnapshot(testCtx, "topologyshallow")
+			return len(shallowSnapshot) == 0, err
+		}, 60*time.Second, time.Second).Should(BeTrue(), "all shallow HyperNodes should be deleted")
 		Consistently(func() (map[string]mixedTopologyHyperNodeSnapshot, error) {
-			return mixedTopologyProfileSnapshot(testCtx, "topologya5")
-		}, 2*time.Second, 200*time.Millisecond).Should(Equal(a5Snapshot),
-			"deleting the A3 tree must not recreate or mutate A5")
+			return mixedTopologyProfileSnapshot(testCtx, "topologydeep")
+		}, 2*time.Second, 200*time.Millisecond).Should(Equal(deepSnapshot),
+			"deleting the shallow tree must not recreate or mutate deep")
 
-		By("restoring A3 after its independent tree was deleted")
+		By("restoring shallow after its independent tree was deleted")
 		for i := 0; i < 4; i++ {
-			Expect(setNodeLabel(testCtx.Kubeclient, fmt.Sprintf("kwok-node-%d", i), mixedProfileLabel, "a3")).To(Succeed())
+			Expect(setNodeLabel(testCtx.Kubeclient, fmt.Sprintf("kwok-node-%d", i), mixedProfileLabel, "shallow")).To(Succeed())
 		}
 		Eventually(func() (bool, error) {
 			return mixedTopologyHasExpectedGraph(testCtx)
 		}, 60*time.Second, time.Second).Should(BeTrue())
-		currentA5, err = mixedTopologyProfileSnapshot(testCtx, "topologya5")
+		currentDeep, err = mixedTopologyProfileSnapshot(testCtx, "topologydeep")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(currentA5).To(Equal(a5Snapshot), "recreating A3 must preserve the independent A5 tree")
+		Expect(currentDeep).To(Equal(deepSnapshot), "recreating shallow must preserve the independent deep tree")
 	})
 
 	It("selects feasible hard topology trees without crossing semantic boundaries", func() {
@@ -184,49 +186,54 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 			Expect(restoreNodeLabels(testCtx.Kubeclient, originalNodes)).To(Succeed())
 		}()
 
-		By("enabling A3 and A5 label discovery profiles")
+		By("enabling single-tier shallow and three-tier deep label discovery profiles")
 		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, mixedTopologyDiscoveryConfig())).To(Succeed())
 		Eventually(func() (bool, error) {
-			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
+			return mixedTopologyHasExpectedTiers(testCtx, 6, "", 2)
 		}, 60*time.Second, time.Second).Should(BeTrue())
 
-		By("selecting A3 when A5 is the only resource-infeasible tree")
-		a5Blockers := createMixedTopologyBlockers(testCtx, "mixed-a5-blocker", []int{4, 5, 6, 7})
-		a3OnlyJob := createMixedTopologyHardJob(testCtx, "mixed-hard-a3-only", "volcano.sh/hypercluster", 4)
-		Expect(e2eutil.WaitJobReady(testCtx, a3OnlyJob)).NotTo(HaveOccurred())
-		Expect(e2eutil.VerifyPodScheduling(testCtx, a3OnlyJob,
-			[]string{"kwok-node-0", "kwok-node-1", "kwok-node-2", "kwok-node-3"})).NotTo(HaveOccurred())
-		e2eutil.DeleteJob(testCtx, a3OnlyJob)
-		Expect(e2eutil.WaitJobCleanedUp(testCtx, a3OnlyJob)).NotTo(HaveOccurred())
-		deleteMixedTopologyBlockers(testCtx, a5Blockers)
+		By("selecting shallow when deep is the only resource-infeasible tree")
+		deepBlockers := createMixedTopologyBlockers(testCtx, "mixed-deep-blocker", []int{4, 5, 6, 7})
+		shallowOnlyJob := createMixedTopologyHardJob(testCtx, "mixed-hard-shallow-only", "volcano.sh/hypercluster", 2)
+		Expect(e2eutil.WaitJobReady(testCtx, shallowOnlyJob)).NotTo(HaveOccurred())
+		hasShallow, hasDeep, err := mixedTopologyJobUsesProfiles(testCtx, shallowOnlyJob)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasShallow).To(BeTrue())
+		Expect(hasDeep).To(BeFalse())
+		shallowDomains, err := mixedTopologyJobDomains(testCtx, shallowOnlyJob, mixedShallowDomainLabel)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(shallowDomains).To(HaveLen(1), "the hard gang must fit within one shallow domain")
+		e2eutil.DeleteJob(testCtx, shallowOnlyJob)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, shallowOnlyJob)).NotTo(HaveOccurred())
+		deleteMixedTopologyBlockers(testCtx, deepBlockers)
 
-		By("selecting A5 when only its semantic hypernode domain can contain the gang")
-		a5OnlyJob := createMixedTopologyHardJob(testCtx, "mixed-hard-a5-only", "volcano.sh/hypernode", 4)
-		Expect(e2eutil.WaitJobReady(testCtx, a5OnlyJob)).NotTo(HaveOccurred())
-		Expect(e2eutil.VerifyPodScheduling(testCtx, a5OnlyJob,
+		By("selecting deep when only its semantic hypernode domain can contain the gang")
+		deepOnlyJob := createMixedTopologyHardJob(testCtx, "mixed-hard-deep-only", "volcano.sh/hypernode", 2)
+		Expect(e2eutil.WaitJobReady(testCtx, deepOnlyJob)).NotTo(HaveOccurred())
+		Expect(e2eutil.VerifyPodScheduling(testCtx, deepOnlyJob,
 			[]string{"kwok-node-4", "kwok-node-5", "kwok-node-6", "kwok-node-7"})).NotTo(HaveOccurred())
-		e2eutil.DeleteJob(testCtx, a5OnlyJob)
-		Expect(e2eutil.WaitJobCleanedUp(testCtx, a5OnlyJob)).NotTo(HaveOccurred())
+		e2eutil.DeleteJob(testCtx, deepOnlyJob)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, deepOnlyJob)).NotTo(HaveOccurred())
 
 		By("keeping a hard gang in one real tree when both trees are feasible")
-		bothFeasibleJob := createMixedTopologyHardJob(testCtx, "mixed-hard-both-feasible", "volcano.sh/hypercluster", 4)
+		bothFeasibleJob := createMixedTopologyHardJob(testCtx, "mixed-hard-both-feasible", "volcano.sh/hypercluster", 2)
 		Expect(e2eutil.WaitJobReady(testCtx, bothFeasibleJob)).NotTo(HaveOccurred())
-		hasA3, hasA5, err := mixedTopologyJobUsesProfiles(testCtx, bothFeasibleJob)
+		hasShallow, hasDeep, err = mixedTopologyJobUsesProfiles(testCtx, bothFeasibleJob)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(hasA3 != hasA5).To(BeTrue(), "a hard gang must select exactly one feasible real tree")
+		Expect(hasShallow != hasDeep).To(BeTrue(), "a hard gang must select exactly one feasible real tree")
 		e2eutil.DeleteJob(testCtx, bothFeasibleJob)
 		Expect(e2eutil.WaitJobCleanedUp(testCtx, bothFeasibleJob)).NotTo(HaveOccurred())
 
-		By("excluding A3 when the requested semantic tier exists only in A5")
-		a5TierOnlyJob := createMixedTopologyHardJob(testCtx, "mixed-hard-a5-tier-only", "volcano.sh/superpod", 2)
-		Expect(e2eutil.WaitJobReady(testCtx, a5TierOnlyJob)).NotTo(HaveOccurred())
-		Expect(e2eutil.VerifyPodScheduling(testCtx, a5TierOnlyJob,
+		By("excluding shallow when the requested semantic superpod tier exists only in deep")
+		deepTierOnlyJob := createMixedTopologyHardJob(testCtx, "mixed-hard-deep-tier-only", "volcano.sh/superpod", 2)
+		Expect(e2eutil.WaitJobReady(testCtx, deepTierOnlyJob)).NotTo(HaveOccurred())
+		Expect(e2eutil.VerifyPodScheduling(testCtx, deepTierOnlyJob,
 			[]string{"kwok-node-4", "kwok-node-5", "kwok-node-6", "kwok-node-7"})).NotTo(HaveOccurred())
-		domains, err := mixedTopologyJobDomains(testCtx, a5TierOnlyJob, mixedA5SuperPodLabel)
+		domains, err := mixedTopologyJobDomains(testCtx, deepTierOnlyJob, mixedDeepSuperPodLabel)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(domains).To(HaveLen(1), "the hard gang must fit within one A5 superpod")
-		e2eutil.DeleteJob(testCtx, a5TierOnlyJob)
-		Expect(e2eutil.WaitJobCleanedUp(testCtx, a5TierOnlyJob)).NotTo(HaveOccurred())
+		Expect(domains).To(HaveLen(1), "the hard gang must fit within one deep superpod")
+		e2eutil.DeleteJob(testCtx, deepTierOnlyJob)
+		Expect(e2eutil.WaitJobCleanedUp(testCtx, deepTierOnlyJob)).NotTo(HaveOccurred())
 
 		By("keeping the complete hard gang pending when neither tree is feasible")
 		allBlockers := createMixedTopologyBlockers(testCtx, "mixed-all-blocker", []int{0, 1, 2, 3, 4, 5, 6, 7})
@@ -237,7 +244,7 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		Consistently(func() (bool, error) {
 			return mixedTopologyJobPodsUnbound(testCtx, neitherFeasibleJob, 4)
 		}, 10*time.Second, 250*time.Millisecond).Should(BeTrue(),
-			"an infeasible hard gang must not partially bind or cross A3 and A5")
+			"an infeasible hard gang must not partially bind or cross shallow and deep")
 	})
 
 	It("keeps hard subgroups in their semantic domains across pod and scheduler restarts", func() {
@@ -252,13 +259,13 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 			Expect(restoreNodeLabels(testCtx.Kubeclient, originalNodes)).To(Succeed())
 		}()
 
-		By("enabling A3 and A5 label discovery profiles")
+		By("enabling single-tier shallow and three-tier deep label discovery profiles")
 		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, mixedTopologyDiscoveryConfig())).To(Succeed())
 		Eventually(func() (bool, error) {
-			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
+			return mixedTopologyHasExpectedTiers(testCtx, 6, "", 2)
 		}, 60*time.Second, time.Second).Should(BeTrue())
 
-		By("scheduling two hard subgroups on the A5-only superpod tier")
+		By("scheduling two hard subgroups on the deep-only superpod tier")
 		job := e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
 			Name: "mixed-hard-subgroup-job",
 			NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
@@ -286,17 +293,17 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		defer e2eutil.DeleteJob(testCtx, job)
 		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
 
-		domainsBefore, err := mixedTopologySubGroupDomains(testCtx, job, "a5", mixedA5SuperPodLabel, 2, 2)
+		domainsBefore, err := mixedTopologySubGroupDomains(testCtx, job, "deep", mixedDeepSuperPodLabel, 2, 2)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(sets.New(domainsBefore["0"], domainsBefore["1"])).To(HaveLen(2),
-			"the two CPU-saturated subgroups must occupy different A5 superpods")
+			"the two CPU-saturated subgroups must occupy different deep superpods")
 
 		By("deleting one subgroup pod and waiting for a different pod instance")
 		Expect(replaceMixedTopologyJobPod(testCtx, job, "0", 4)).To(Succeed())
 		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
 
 		By("verifying the replacement remains in the original subgroup superpod")
-		domainsAfter, err := mixedTopologySubGroupDomains(testCtx, job, "a5", mixedA5SuperPodLabel, 2, 2)
+		domainsAfter, err := mixedTopologySubGroupDomains(testCtx, job, "deep", mixedDeepSuperPodLabel, 2, 2)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(domainsAfter).To(Equal(domainsBefore))
 
@@ -308,7 +315,7 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
 
 		By("verifying scheduler recovery keeps every subgroup in its original superpod")
-		domainsAfterRestart, err := mixedTopologySubGroupDomains(testCtx, job, "a5", mixedA5SuperPodLabel, 2, 2)
+		domainsAfterRestart, err := mixedTopologySubGroupDomains(testCtx, job, "deep", mixedDeepSuperPodLabel, 2, 2)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(domainsAfterRestart).To(Equal(domainsBefore))
 	})
@@ -325,10 +332,10 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 			Expect(restoreNodeLabels(testCtx.Kubeclient, originalNodes)).To(Succeed())
 		}()
 
-		By("enabling A3 and A5 label discovery profiles")
+		By("enabling single-tier shallow and three-tier deep label discovery profiles")
 		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, mixedTopologyDiscoveryConfig())).To(Succeed())
 		Eventually(func() (bool, error) {
-			return mixedTopologyHasExpectedTiers(testCtx, 7, "")
+			return mixedTopologyHasExpectedTiers(testCtx, 6, "", 2)
 		}, 60*time.Second, time.Second).Should(BeTrue())
 
 		By("scheduling a soft job entirely within one real topology tree")
@@ -347,9 +354,9 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 			}},
 		})
 		Expect(e2eutil.WaitJobReady(testCtx, singleTreeJob)).NotTo(HaveOccurred())
-		hasA3, hasA5, err := mixedTopologyJobUsesProfiles(testCtx, singleTreeJob)
+		hasShallow, hasDeep, err := mixedTopologyJobUsesProfiles(testCtx, singleTreeJob)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(hasA3 != hasA5).To(BeTrue(), "a soft job that fits in one tree must not span A3 and A5")
+		Expect(hasShallow != hasDeep).To(BeTrue(), "a soft job that fits in one tree must not span shallow and deep")
 		e2eutil.DeleteJob(testCtx, singleTreeJob)
 		Expect(e2eutil.WaitJobCleanedUp(testCtx, singleTreeJob)).NotTo(HaveOccurred())
 
@@ -369,10 +376,10 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 			}},
 		})
 		Expect(e2eutil.WaitJobReady(testCtx, crossTreeJob)).NotTo(HaveOccurred())
-		hasA3, hasA5, err = mixedTopologyJobUsesProfiles(testCtx, crossTreeJob)
+		hasShallow, hasDeep, err = mixedTopologyJobUsesProfiles(testCtx, crossTreeJob)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(hasA3).To(BeTrue(), "virtual-root fallback should use the A3 tree")
-		Expect(hasA5).To(BeTrue(), "virtual-root fallback should use the A5 tree")
+		Expect(hasShallow).To(BeTrue(), "virtual-root fallback should use the shallow tree")
+		Expect(hasDeep).To(BeTrue(), "virtual-root fallback should use the deep tree")
 		e2eutil.DeleteJob(testCtx, crossTreeJob)
 		Expect(e2eutil.WaitJobCleanedUp(testCtx, crossTreeJob)).NotTo(HaveOccurred())
 
@@ -401,9 +408,9 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 			}},
 		})
 		Expect(e2eutil.WaitJobReady(testCtx, hardJobSoftSubGroups)).NotTo(HaveOccurred())
-		hasA3, hasA5, err = mixedTopologyJobUsesProfiles(testCtx, hardJobSoftSubGroups)
+		hasShallow, hasDeep, err = mixedTopologyJobUsesProfiles(testCtx, hardJobSoftSubGroups)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(hasA3 != hasA5).To(BeTrue(), "soft subgroups must not escape the hard job's selected tree")
+		Expect(hasShallow != hasDeep).To(BeTrue(), "soft subgroups must not escape the hard job's selected tree")
 		subGroupProfiles, err := mixedTopologySubGroupProfiles(testCtx, hardJobSoftSubGroups, 2, 2)
 		Expect(err).NotTo(HaveOccurred())
 		for partition, profiles := range subGroupProfiles {
@@ -435,7 +442,7 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 		Expect(e2eutil.WaitJobReady(testCtx, virtualRootSubGroup)).NotTo(HaveOccurred())
 		subGroupProfiles, err = mixedTopologySubGroupProfiles(testCtx, virtualRootSubGroup, 1, 8)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(subGroupProfiles["0"]).To(Equal(sets.New("a3", "a5")),
+		Expect(subGroupProfiles["0"]).To(Equal(sets.New("shallow", "deep")),
 			"a soft subgroup larger than either real tree must use the virtual root")
 		e2eutil.DeleteJob(testCtx, virtualRootSubGroup)
 		Expect(e2eutil.WaitJobCleanedUp(testCtx, virtualRootSubGroup)).NotTo(HaveOccurred())
@@ -460,7 +467,7 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 								MatchExpressions: []v1.NodeSelectorRequirement{{
 									Key:      mixedProfileLabel,
 									Operator: v1.NodeSelectorOpIn,
-									Values:   []string{"a3", "a5"},
+									Values:   []string{"shallow", "deep"},
 								}},
 							}},
 						},
@@ -489,9 +496,194 @@ var _ = Describe("Mixed A3 and A5 topology", Serial, func() {
 			}
 			return controlledPods == 9, nil
 		}, 10*time.Second, 250*time.Millisecond).Should(BeTrue(),
-			"an unsatisfied soft gang must not partially bind across A3 and A5")
+			"an unsatisfied soft gang must not partially bind across shallow and deep")
 	})
 })
+
+var _ = Describe("Mixed topology profile combinations", Serial, func() {
+	var testCtx *e2eutil.TestContext
+
+	BeforeEach(func() {
+		testCtx = e2eutil.InitTestContext(e2eutil.Options{NodesNumLimit: 8})
+	})
+
+	AfterEach(func() {
+		e2eutil.CleanupTestContext(testCtx)
+	})
+
+	It("keeps three arbitrary topology depths independent", func() {
+		controllerConfigMap, err := findControllerConfigMap(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		originalConfig := controllerConfigMap.Data["volcano-controller.conf"]
+		originalNodes, err := labelThreeMixedTopologyNodes(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		defer func() {
+			Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, originalConfig)).To(Succeed())
+			Expect(restoreNodeLabels(testCtx.Kubeclient, originalNodes)).To(Succeed())
+		}()
+
+		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, threeMixedTopologyDiscoveryConfig())).To(Succeed())
+		Eventually(func() (bool, error) {
+			return threeMixedTopologyHasExpectedGraph(testCtx)
+		}, 60*time.Second, time.Second).Should(BeTrue())
+
+		By("selecting the only three-tier tree that can contain a four-pod hard gang")
+		job := createMixedTopologyHardJob(testCtx, "three-profile-hard-job", "volcano.sh/hypercluster", 4)
+		defer e2eutil.DeleteJob(testCtx, job)
+		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
+		Expect(e2eutil.VerifyPodScheduling(testCtx, job,
+			[]string{"kwok-node-4", "kwok-node-5", "kwok-node-6", "kwok-node-7"})).NotTo(HaveOccurred())
+	})
+})
+
+func labelThreeMixedTopologyNodes(client kubernetes.Interface) (map[string]*v1.Node, error) {
+	originals := make(map[string]*v1.Node, 8)
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("kwok-node-%d", i)
+		node, err := client.CoreV1().Nodes().Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		originals[name] = node.DeepCopy()
+		if err := updateNodeLabels(client, name, func(labels map[string]string) {
+			labels[mixedClusterLabel] = "hc-shared"
+			switch {
+			case i < 2:
+				labels[mixedProfileLabel] = "compact"
+				labels[mixedCompactClusterLabel] = "compact-0"
+			case i < 4:
+				labels[mixedProfileLabel] = "wide"
+				labels[mixedWideHyperNodeLabel] = "wide-0"
+			case i < 6:
+				labels[mixedProfileLabel] = "deep"
+				labels[mixedDeepHyperNodeLabel] = "deep-0"
+				labels[mixedDeepSuperPodLabel] = "deep-sp-0"
+			default:
+				labels[mixedProfileLabel] = "deep"
+				labels[mixedDeepHyperNodeLabel] = "deep-0"
+				labels[mixedDeepSuperPodLabel] = "deep-sp-1"
+			}
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return originals, nil
+}
+
+func threeMixedTopologyDiscoveryConfig() string {
+	return `networkTopologyDiscovery:
+  - source: label
+    enabled: true
+    config:
+      networkTopologyTypes:
+        topologycompact:
+          nodeSelector:
+            matchLabels:
+              volcano.sh/e2e-topology-profile: compact
+          levels:
+            - nodeLabel: volcano.sh/e2e-compact-hypercluster
+              tierName: volcano.sh/hypercluster
+            - nodeLabel: kubernetes.io/hostname
+        topologywide:
+          nodeSelector:
+            matchLabels:
+              volcano.sh/e2e-topology-profile: wide
+          levels:
+            - nodeLabel: volcano.sh/e2e-hypercluster
+              tierName: volcano.sh/hypercluster
+            - nodeLabel: volcano.sh/e2e-wide-hypernode
+              tierName: volcano.sh/hypernode
+            - nodeLabel: kubernetes.io/hostname
+        topologydeep:
+          nodeSelector:
+            matchLabels:
+              volcano.sh/e2e-topology-profile: deep
+          levels:
+            - nodeLabel: volcano.sh/e2e-hypercluster
+              tierName: volcano.sh/hypercluster
+            - nodeLabel: volcano.sh/e2e-deep-hypernode
+              tierName: volcano.sh/hypernode
+            - nodeLabel: volcano.sh/e2e-deep-superpod
+              tierName: volcano.sh/superpod
+            - nodeLabel: kubernetes.io/hostname
+`
+}
+
+func threeMixedTopologyHasExpectedGraph(testCtx *e2eutil.TestContext) (bool, error) {
+	hyperNodes, err := testCtx.Vcclient.TopologyV1alpha1().HyperNodes().List(context.Background(), metav1.ListOptions{
+		LabelSelector: labels.Set{mixedTopologySourceKey: "label"}.AsSelector().String(),
+	})
+	if err != nil {
+		return false, err
+	}
+	if len(hyperNodes.Items) != 7 {
+		return false, nil
+	}
+	byProfile := map[string]map[int][]*topologyv1alpha1.HyperNode{}
+	for i := range hyperNodes.Items {
+		hn := &hyperNodes.Items[i]
+		profile := hn.Labels[mixedTopologyProfileKey]
+		if byProfile[profile] == nil {
+			byProfile[profile] = map[int][]*topologyv1alpha1.HyperNode{}
+		}
+		byProfile[profile][hn.Spec.Tier] = append(byProfile[profile][hn.Spec.Tier], hn)
+	}
+	check := func(profile string, tierNames map[int]string, expectedLeafNodes sets.Set[string]) bool {
+		byTier := byProfile[profile]
+		if len(byTier) != len(tierNames) {
+			return false
+		}
+		for tier, name := range tierNames {
+			items := byTier[tier]
+			if len(items) == 0 {
+				return false
+			}
+			for _, hn := range items {
+				if hn.Spec.TierName != name || hn.Labels[mixedTopologyProfileKey] != profile {
+					return false
+				}
+			}
+		}
+		leafNodes := sets.New[string]()
+		for _, leaf := range byTier[1] {
+			for _, member := range leaf.Spec.Members {
+				if member.Type != topologyv1alpha1.MemberTypeNode || member.Selector.ExactMatch == nil {
+					return false
+				}
+				leafNodes.Insert(member.Selector.ExactMatch.Name)
+			}
+		}
+		if !leafNodes.Equal(expectedLeafNodes) {
+			return false
+		}
+		previousTier := byTier[1]
+		maxTier := len(tierNames)
+		for tier := 2; tier <= maxTier; tier++ {
+			if len(byTier[tier]) != 1 {
+				return false
+			}
+			expectedChildren := sets.New[string]()
+			for _, child := range previousTier {
+				expectedChildren.Insert(child.Name)
+			}
+			actualChildren := sets.New[string]()
+			for _, member := range byTier[tier][0].Spec.Members {
+				if member.Type != topologyv1alpha1.MemberTypeHyperNode || member.Selector.ExactMatch == nil {
+					return false
+				}
+				actualChildren.Insert(member.Selector.ExactMatch.Name)
+			}
+			if !actualChildren.Equal(expectedChildren) {
+				return false
+			}
+			previousTier = byTier[tier]
+		}
+		return true
+	}
+	return check("topologycompact", map[int]string{1: "volcano.sh/hypercluster"}, sets.New("kwok-node-0", "kwok-node-1")) &&
+		check("topologywide", map[int]string{1: "volcano.sh/hypernode", 2: "volcano.sh/hypercluster"}, sets.New("kwok-node-2", "kwok-node-3")) &&
+		check("topologydeep", map[int]string{1: "volcano.sh/superpod", 2: "volcano.sh/hypernode", 3: "volcano.sh/hypercluster"}, sets.New("kwok-node-4", "kwok-node-5", "kwok-node-6", "kwok-node-7")), nil
+}
 
 func findControllerConfigMap(client kubernetes.Interface) (*v1.ConfigMap, error) {
 	configMaps, err := client.CoreV1().ConfigMaps(v1.NamespaceAll).List(context.Background(), metav1.ListOptions{})
@@ -547,12 +739,12 @@ func labelMixedTopologyNodes(client kubernetes.Interface) (map[string]*v1.Node, 
 		if err := updateNodeLabels(client, name, func(labels map[string]string) {
 			labels[mixedClusterLabel] = "hc-shared"
 			if i < 4 {
-				labels[mixedProfileLabel] = "a3"
-				labels[mixedA3HyperNodeLabel] = fmt.Sprintf("hn-a3-%d", i/2)
+				labels[mixedProfileLabel] = "shallow"
+				labels[mixedShallowDomainLabel] = fmt.Sprintf("hn-shallow-%d", i/2)
 			} else {
-				labels[mixedProfileLabel] = "a5"
-				labels[mixedA5HyperNodeLabel] = "hn-a5"
-				labels[mixedA5SuperPodLabel] = fmt.Sprintf("sp-a5-%d", (i-4)/2)
+				labels[mixedProfileLabel] = "deep"
+				labels[mixedDeepHyperNodeLabel] = "hn-deep"
+				labels[mixedDeepSuperPodLabel] = fmt.Sprintf("sp-deep-%d", (i-4)/2)
 			}
 		}); err != nil {
 			return nil, err
@@ -601,7 +793,7 @@ func updateNodeLabels(client kubernetes.Interface, nodeName string, update func(
 	})
 }
 
-func mixedTopologyHasExpectedTiers(testCtx *e2eutil.TestContext, expectedCount int, expectedDomain string) (bool, error) {
+func mixedTopologyHasExpectedTiers(testCtx *e2eutil.TestContext, expectedCount int, expectedDomain string, expectedShallowTier1 int) (bool, error) {
 	hyperNodes, err := testCtx.Vcclient.TopologyV1alpha1().HyperNodes().List(context.Background(), metav1.ListOptions{
 		LabelSelector: labels.Set{mixedTopologySourceKey: "label"}.AsSelector().String(),
 	})
@@ -620,17 +812,16 @@ func mixedTopologyHasExpectedTiers(testCtx *e2eutil.TestContext, expectedCount i
 			tiersByName[hyperNode.Spec.TierName] = make(map[int]int)
 		}
 		tiersByName[hyperNode.Spec.TierName][hyperNode.Spec.Tier]++
-		if hyperNode.Labels[mixedA3HyperNodeLabel] == expectedDomain {
+		if hyperNode.Labels[mixedShallowDomainLabel] == expectedDomain {
 			domainFound = true
 		}
 	}
 
 	return domainFound &&
-		tiersByName["volcano.sh/hypernode"][1] >= 2 &&
+		tiersByName["volcano.sh/hypercluster"][1] == expectedShallowTier1 &&
+		tiersByName["volcano.sh/superpod"][1] == 2 &&
 		tiersByName["volcano.sh/hypernode"][2] == 1 &&
-		tiersByName["volcano.sh/hypercluster"][2] == 1 &&
-		tiersByName["volcano.sh/hypercluster"][3] == 1 &&
-		tiersByName["volcano.sh/superpod"][1] == 2, nil
+		tiersByName["volcano.sh/hypercluster"][3] == 1, nil
 }
 
 func mixedTopologyHasExpectedGraph(testCtx *e2eutil.TestContext) (bool, error) {
@@ -640,7 +831,7 @@ func mixedTopologyHasExpectedGraph(testCtx *e2eutil.TestContext) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if len(hyperNodes.Items) != 7 {
+	if len(hyperNodes.Items) != 6 {
 		return false, nil
 	}
 
@@ -651,39 +842,39 @@ func mixedTopologyHasExpectedGraph(testCtx *e2eutil.TestContext) (bool, error) {
 		byProfile[profile] = append(byProfile[profile], hyperNode)
 	}
 
-	validateProfile := func(profile string, expectedNodes sets.Set[string], expectedTierNames map[int]string) (string, bool) {
+	validateProfile := func(profile string, expectedNodes sets.Set[string], expectedTierNames map[int]string) (sets.Set[string], bool) {
 		byTier := map[int][]*topologyv1alpha1.HyperNode{}
 		for _, hyperNode := range byProfile[profile] {
 			if hyperNode.Spec.TierName != expectedTierNames[hyperNode.Spec.Tier] {
-				return "", false
+				return nil, false
 			}
 			byTier[hyperNode.Spec.Tier] = append(byTier[hyperNode.Spec.Tier], hyperNode)
 		}
 		if len(byTier[1]) != 2 || len(byProfile[profile]) != len(expectedTierNames)+1 {
-			return "", false
+			return nil, false
 		}
 
 		leafNodes := sets.New[string]()
 		for _, leaf := range byTier[1] {
 			if len(leaf.Spec.Members) != 2 {
-				return "", false
+				return nil, false
 			}
 			for _, member := range leaf.Spec.Members {
 				if member.Type != topologyv1alpha1.MemberTypeNode || member.Selector.ExactMatch == nil {
-					return "", false
+					return nil, false
 				}
 				leafNodes.Insert(member.Selector.ExactMatch.Name)
 			}
 		}
 		if !leafNodes.Equal(expectedNodes) {
-			return "", false
+			return nil, false
 		}
 
 		previousTier := byTier[1]
-		var root *topologyv1alpha1.HyperNode
+		topLevel := sets.New[string]()
 		for tier := 2; tier <= len(expectedTierNames); tier++ {
 			if len(byTier[tier]) != 1 {
-				return "", false
+				return nil, false
 			}
 			expectedMembers := sets.New[string]()
 			for _, child := range previousTier {
@@ -692,34 +883,40 @@ func mixedTopologyHasExpectedGraph(testCtx *e2eutil.TestContext) (bool, error) {
 			actualMembers := sets.New[string]()
 			for _, member := range byTier[tier][0].Spec.Members {
 				if member.Type != topologyv1alpha1.MemberTypeHyperNode || member.Selector.ExactMatch == nil {
-					return "", false
+					return nil, false
 				}
 				actualMembers.Insert(member.Selector.ExactMatch.Name)
 			}
 			if !actualMembers.Equal(expectedMembers) {
-				return "", false
+				return nil, false
 			}
-			root = byTier[tier][0]
+			topLevel.Insert(byTier[tier][0].Name)
 			previousTier = byTier[tier]
 		}
-		if root == nil || root.Labels[mixedClusterLabel] != "hc-shared" {
-			return "", false
+		if len(expectedTierNames) == 1 {
+			for _, leaf := range byTier[1] {
+				topLevel.Insert(leaf.Name)
+			}
 		}
-		return root.Name, true
+		return topLevel, true
 	}
 
-	a3Root, a3Valid := validateProfile("topologya3", sets.New[string](
+	shallowRoots, shallowValid := validateProfile("topologyshallow", sets.New[string](
 		"kwok-node-0", "kwok-node-1", "kwok-node-2", "kwok-node-3"), map[int]string{
-		1: "volcano.sh/hypernode",
-		2: "volcano.sh/hypercluster",
+		1: "volcano.sh/hypercluster",
 	})
-	a5Root, a5Valid := validateProfile("topologya5", sets.New[string](
+	deepRoots, deepValid := validateProfile("topologydeep", sets.New[string](
 		"kwok-node-4", "kwok-node-5", "kwok-node-6", "kwok-node-7"), map[int]string{
 		1: "volcano.sh/superpod",
 		2: "volcano.sh/hypernode",
 		3: "volcano.sh/hypercluster",
 	})
-	return a3Valid && a5Valid && a3Root != a5Root, nil
+	for root := range shallowRoots {
+		if deepRoots.Has(root) {
+			return false, nil
+		}
+	}
+	return shallowValid && deepValid, nil
 }
 
 func mixedTopologyProfileSnapshot(testCtx *e2eutil.TestContext, profile string) (map[string]mixedTopologyHyperNodeSnapshot, error) {
@@ -744,8 +941,8 @@ func mixedTopologyProfileSnapshot(testCtx *e2eutil.TestContext, profile string) 
 }
 
 func mixedTopologyJobUsesProfiles(testCtx *e2eutil.TestContext, job *batchv1alpha1.Job) (bool, bool, error) {
-	hasA3 := false
-	hasA5 := false
+	hasShallow := false
+	hasDeep := false
 	for _, pod := range e2eutil.GetTasksOfJob(testCtx, job) {
 		if pod.Spec.NodeName == "" {
 			return false, false, fmt.Errorf("pod %s/%s is not scheduled", pod.Namespace, pod.Name)
@@ -755,15 +952,15 @@ func mixedTopologyJobUsesProfiles(testCtx *e2eutil.TestContext, job *batchv1alph
 			return false, false, err
 		}
 		switch node.Labels[mixedProfileLabel] {
-		case "a3":
-			hasA3 = true
-		case "a5":
-			hasA5 = true
+		case "shallow":
+			hasShallow = true
+		case "deep":
+			hasDeep = true
 		default:
 			return false, false, fmt.Errorf("pod %s/%s scheduled to node %s without a mixed topology profile", pod.Namespace, pod.Name, pod.Spec.NodeName)
 		}
 	}
-	return hasA3, hasA5, nil
+	return hasShallow, hasDeep, nil
 }
 
 func createMixedTopologyHardJob(
@@ -888,7 +1085,7 @@ func mixedTopologySubGroupProfiles(
 			return nil, err
 		}
 		profile := node.Labels[mixedProfileLabel]
-		if profile != "a3" && profile != "a5" {
+		if profile != "shallow" && profile != "deep" {
 			return nil, fmt.Errorf("pod %s/%s is on node %s with unexpected profile %q",
 				pod.Namespace, pod.Name, node.Name, profile)
 		}
@@ -1122,26 +1319,24 @@ func mixedTopologyDiscoveryConfig() string {
     enabled: true
     config:
       networkTopologyTypes:
-        topologyA3:
+        topologyshallow:
           nodeSelector:
             matchLabels:
-              volcano.sh/e2e-topology-profile: a3
+              volcano.sh/e2e-topology-profile: shallow
           levels:
-            - nodeLabel: volcano.sh/e2e-hypercluster
+            - nodeLabel: volcano.sh/e2e-shallow-domain
               tierName: volcano.sh/hypercluster
-            - nodeLabel: volcano.sh/e2e-a3-hypernode
-              tierName: volcano.sh/hypernode
             - nodeLabel: kubernetes.io/hostname
-        topologyA5:
+        topologydeep:
           nodeSelector:
             matchLabels:
-              volcano.sh/e2e-topology-profile: a5
+              volcano.sh/e2e-topology-profile: deep
           levels:
             - nodeLabel: volcano.sh/e2e-hypercluster
               tierName: volcano.sh/hypercluster
-            - nodeLabel: volcano.sh/e2e-a5-hypernode
+            - nodeLabel: volcano.sh/e2e-deep-hypernode
               tierName: volcano.sh/hypernode
-            - nodeLabel: volcano.sh/e2e-a5-superpod
+            - nodeLabel: volcano.sh/e2e-deep-superpod
               tierName: volcano.sh/superpod
             - nodeLabel: kubernetes.io/hostname
 `

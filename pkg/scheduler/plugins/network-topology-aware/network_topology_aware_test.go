@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
@@ -3413,13 +3414,13 @@ func TestBatchNodeOrderFnForNormalPodsUsesTreeLocalTiers(t *testing.T) {
 	}
 
 	hyperNodes := api.HyperNodeInfoMap{
-		"a3-leaf": newHyperNode("a3-leaf", 1),
-		"a3-root": newHyperNode("a3-root", 2, "a3-leaf"),
-		"a5-leaf": newHyperNode("a5-leaf", 1),
-		"a5-mid":  newHyperNode("a5-mid", 2, "a5-leaf"),
-		"a5-root": newHyperNode("a5-root", 3, "a5-mid"),
+		"shallow-leaf": newHyperNode("shallow-leaf", 1),
+		"shallow-root": newHyperNode("shallow-root", 2, "shallow-leaf"),
+		"deep-leaf":    newHyperNode("deep-leaf", 1),
+		"deep-mid":     newHyperNode("deep-mid", 2, "deep-leaf"),
+		"deep-root":    newHyperNode("deep-root", 3, "deep-mid"),
 		framework.ClusterTopHyperNode: newHyperNode(
-			framework.ClusterTopHyperNode, 4, "a3-root", "a5-root"),
+			framework.ClusterTopHyperNode, 4, "shallow-root", "deep-root"),
 	}
 	for _, parent := range hyperNodes {
 		for child := range parent.Children {
@@ -3430,18 +3431,18 @@ func TestBatchNodeOrderFnForNormalPodsUsesTreeLocalTiers(t *testing.T) {
 	ssn := &framework.Session{
 		HyperNodes: hyperNodes,
 		HyperNodesSetByTier: map[int]sets.Set[string]{
-			1: sets.New[string]("a3-leaf", "a5-leaf"),
-			2: sets.New[string]("a3-root", "a5-mid"),
-			3: sets.New[string]("a5-root"),
+			1: sets.New[string]("shallow-leaf", "deep-leaf"),
+			2: sets.New[string]("shallow-root", "deep-mid"),
+			3: sets.New[string]("deep-root"),
 			4: sets.New[string](framework.ClusterTopHyperNode),
 		},
 		RealNodesSet: map[string]sets.Set[string]{
-			"a3-leaf":                     sets.New[string]("a3-node"),
-			"a3-root":                     sets.New[string]("a3-node"),
-			"a5-leaf":                     sets.New[string]("a5-node"),
-			"a5-mid":                      sets.New[string]("a5-node"),
-			"a5-root":                     sets.New[string]("a5-node"),
-			framework.ClusterTopHyperNode: sets.New[string]("a3-node", "a5-node", "outside-node"),
+			"shallow-leaf":                sets.New[string]("shallow-node"),
+			"shallow-root":                sets.New[string]("shallow-node"),
+			"deep-leaf":                   sets.New[string]("deep-node"),
+			"deep-mid":                    sets.New[string]("deep-node"),
+			"deep-root":                   sets.New[string]("deep-node"),
+			framework.ClusterTopHyperNode: sets.New[string]("shallow-node", "deep-node", "outside-node"),
 		},
 	}
 
@@ -3467,23 +3468,23 @@ func TestBatchNodeOrderFnForNormalPodsUsesTreeLocalTiers(t *testing.T) {
 		Name:   "normal-pod",
 		Resreq: &api.Resource{MilliCPU: 10},
 	}
-	nodes := []*api.NodeInfo{{Name: "a3-node"}, {Name: "a5-node"}, {Name: "outside-node"}}
+	nodes := []*api.NodeInfo{{Name: "shallow-node"}, {Name: "deep-node"}, {Name: "outside-node"}}
 
 	scores, err := plugin.batchNodeOrderFnForNormalPods(ssn, task, nodes)
 	assert.NoError(t, err)
-	assert.InDelta(t, 0.5, scores["a3-node"], 1e-9)
-	assert.InDelta(t, 0.5, scores["a5-node"], 1e-9)
-	assert.InDelta(t, scores["a3-node"], scores["a5-node"], 1e-9,
+	assert.InDelta(t, 0.5, scores["shallow-node"], 1e-9)
+	assert.InDelta(t, 0.5, scores["deep-node"], 1e-9)
+	assert.InDelta(t, scores["shallow-node"], scores["deep-node"], 1e-9,
 		"equivalent local topology utilization must not favor the shallower tree")
 	assert.Equal(t, FullScore, scores["outside-node"],
 		"a Node outside all real topology trees should retain the preferred fallback score")
 
-	plugin.hyperNodeResourceCache["a3-leaf"].used.MilliCPU = 10
-	plugin.hyperNodeResourceCache["a3-root"].used.MilliCPU = 30
+	plugin.hyperNodeResourceCache["shallow-leaf"].used.MilliCPU = 10
+	plugin.hyperNodeResourceCache["shallow-root"].used.MilliCPU = 30
 	plugin.hyperNodeResourceCache[framework.ClusterTopHyperNode].used.MilliCPU = 70
 	scores, err = plugin.batchNodeOrderFnForNormalPods(ssn, task, nodes[:1])
 	assert.NoError(t, err)
-	assert.InDelta(t, (0.2+0.4*0.5+0.8*0.25)/(1+0.5+0.25), scores["a3-node"], 1e-9,
+	assert.InDelta(t, (0.2+0.4*0.5+0.8*0.25)/(1+0.5+0.25), scores["shallow-node"], 1e-9,
 		"the virtual cluster root should remain the final fading level of a real tree")
 }
 
@@ -3494,16 +3495,16 @@ func TestBatchNodeOrderFnForNetworkAwarePodsUsesTreeLocalLeaf(t *testing.T) {
 		return info
 	}
 
-	a3Node := &api.NodeInfo{Name: "a3-node"}
-	a5Node := &api.NodeInfo{Name: "a5-node"}
+	shallowNode := &api.NodeInfo{Name: "shallow-node"}
+	deepNode := &api.NodeInfo{Name: "deep-node"}
 	hyperNodes := api.HyperNodeInfoMap{
-		"a3-leaf": newHyperNode("a3-leaf", 1),
-		"a3-root": newHyperNode("a3-root", 2, "a3-leaf"),
-		"a5-leaf": newHyperNode("a5-leaf", 0),
-		"a5-mid":  newHyperNode("a5-mid", 1, "a5-leaf"),
-		"a5-root": newHyperNode("a5-root", 2, "a5-mid"),
+		"shallow-leaf": newHyperNode("shallow-leaf", 1),
+		"shallow-root": newHyperNode("shallow-root", 2, "shallow-leaf"),
+		"deep-leaf":    newHyperNode("deep-leaf", 0),
+		"deep-mid":     newHyperNode("deep-mid", 1, "deep-leaf"),
+		"deep-root":    newHyperNode("deep-root", 2, "deep-mid"),
 		framework.ClusterTopHyperNode: newHyperNode(
-			framework.ClusterTopHyperNode, 3, "a3-root", "a5-root"),
+			framework.ClusterTopHyperNode, 3, "shallow-root", "deep-root"),
 	}
 	for _, parent := range hyperNodes {
 		for child := range parent.Children {
@@ -3515,40 +3516,40 @@ func TestBatchNodeOrderFnForNetworkAwarePodsUsesTreeLocalLeaf(t *testing.T) {
 		HyperNodes:      hyperNodes,
 		HyperNodesTiers: []int{0, 1, 2, 3},
 		HyperNodesSetByTier: map[int]sets.Set[string]{
-			0: sets.New[string]("a5-leaf"),
-			1: sets.New[string]("a3-leaf", "a5-mid"),
-			2: sets.New[string]("a3-root", "a5-root"),
+			0: sets.New[string]("deep-leaf"),
+			1: sets.New[string]("shallow-leaf", "deep-mid"),
+			2: sets.New[string]("shallow-root", "deep-root"),
 			3: sets.New[string](framework.ClusterTopHyperNode),
 		},
 		RealNodesList: map[string][]*api.NodeInfo{
-			"a3-leaf":                     {a3Node},
-			"a3-root":                     {a3Node},
-			"a5-leaf":                     {a5Node},
-			"a5-mid":                      {a5Node},
-			"a5-root":                     {a5Node},
-			framework.ClusterTopHyperNode: {a3Node, a5Node},
+			"shallow-leaf":                {shallowNode},
+			"shallow-root":                {shallowNode},
+			"deep-leaf":                   {deepNode},
+			"deep-mid":                    {deepNode},
+			"deep-root":                   {deepNode},
+			framework.ClusterTopHyperNode: {shallowNode, deepNode},
 		},
 		RealNodesSet: map[string]sets.Set[string]{
-			"a3-leaf":                     sets.New[string](a3Node.Name),
-			"a3-root":                     sets.New[string](a3Node.Name),
-			"a5-leaf":                     sets.New[string](a5Node.Name),
-			"a5-mid":                      sets.New[string](a5Node.Name),
-			"a5-root":                     sets.New[string](a5Node.Name),
-			framework.ClusterTopHyperNode: sets.New[string](a3Node.Name, a5Node.Name),
+			"shallow-leaf":                sets.New[string](shallowNode.Name),
+			"shallow-root":                sets.New[string](shallowNode.Name),
+			"deep-leaf":                   sets.New[string](deepNode.Name),
+			"deep-mid":                    sets.New[string](deepNode.Name),
+			"deep-root":                   sets.New[string](deepNode.Name),
+			framework.ClusterTopHyperNode: sets.New[string](shallowNode.Name, deepNode.Name),
 		},
 	}
 	plugin := &networkTopologyAwarePlugin{}
 	task := &api.TaskInfo{
-		TransactionContext: api.TransactionContext{JobAllocatedHyperNode: "a3-leaf"},
+		TransactionContext: api.TransactionContext{JobAllocatedHyperNode: "shallow-leaf"},
 	}
 
-	scores, err := plugin.batchNodeOrderFnForNetworkAwarePods(ssn, task, &api.SubJobInfo{}, []*api.NodeInfo{a3Node})
+	scores, err := plugin.batchNodeOrderFnForNetworkAwarePods(ssn, task, &api.SubJobInfo{}, []*api.NodeInfo{shallowNode})
 	assert.NoError(t, err)
-	assert.Equal(t, FullScore, scores[a3Node.Name],
-		"the A3 Node must resolve its own leaf even when another tree has a lower numeric tier")
+	assert.Equal(t, FullScore, scores[shallowNode.Name],
+		"the shallow Node must resolve its own leaf even when another tree has a lower numeric tier")
 }
 
-func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
+func TestHyperNodeGradientWithMixedDepthTopologies(t *testing.T) {
 	const (
 		hyperNodeTierName    = "volcano.sh/hypernode"
 		hyperClusterTierName = "volcano.sh/hypercluster"
@@ -3573,21 +3574,21 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 	}
 
 	hyperNodes := api.HyperNodeInfoMap{
-		// A3 has two topology tiers: hypernode -> hypercluster.
-		"a3-hypernode-0": newHyperNodeInfo("a3-hypernode-0", 1, hyperNodeTierName),
-		"a3-hypernode-1": newHyperNodeInfo("a3-hypernode-1", 1, hyperNodeTierName),
-		"a3-hypercluster": newHyperNodeInfo(
-			"a3-hypercluster", 2, hyperClusterTierName, "a3-hypernode-0", "a3-hypernode-1"),
+		// shallow has two topology tiers: hypernode -> hypercluster.
+		"shallow-hypernode-0": newHyperNodeInfo("shallow-hypernode-0", 1, hyperNodeTierName),
+		"shallow-hypernode-1": newHyperNodeInfo("shallow-hypernode-1", 1, hyperNodeTierName),
+		"shallow-hypercluster": newHyperNodeInfo(
+			"shallow-hypercluster", 2, hyperClusterTierName, "shallow-hypernode-0", "shallow-hypernode-1"),
 
-		// A5 inserts superpod below hypernode, shifting the same semantic tiers up by one.
-		"a5-superpod-0": newHyperNodeInfo("a5-superpod-0", 1, superPodTierName),
-		"a5-superpod-1": newHyperNodeInfo("a5-superpod-1", 1, superPodTierName),
-		"a5-hypernode": newHyperNodeInfo(
-			"a5-hypernode", 2, hyperNodeTierName, "a5-superpod-0", "a5-superpod-1"),
-		"a5-hypercluster": newHyperNodeInfo(
-			"a5-hypercluster", 3, hyperClusterTierName, "a5-hypernode"),
+		// deep inserts superpod below hypernode, shifting the same semantic tiers up by one.
+		"deep-superpod-0": newHyperNodeInfo("deep-superpod-0", 1, superPodTierName),
+		"deep-superpod-1": newHyperNodeInfo("deep-superpod-1", 1, superPodTierName),
+		"deep-hypernode": newHyperNodeInfo(
+			"deep-hypernode", 2, hyperNodeTierName, "deep-superpod-0", "deep-superpod-1"),
+		"deep-hypercluster": newHyperNodeInfo(
+			"deep-hypercluster", 3, hyperClusterTierName, "deep-hypernode"),
 		framework.ClusterTopHyperNode: newHyperNodeInfo(
-			framework.ClusterTopHyperNode, 4, "", "a3-hypercluster", "a5-hypercluster"),
+			framework.ClusterTopHyperNode, 4, "", "shallow-hypercluster", "deep-hypercluster"),
 	}
 	for _, parent := range hyperNodes {
 		for child := range parent.Children {
@@ -3633,18 +3634,18 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 
 	// highestTierName=hypernode has a different numeric tier in each topology.
 	// Correct behavior must honor the semantic boundary independently per subtree.
-	assert.True(t, candidates.Has("a3-hypernode-0"), "A3 hypernode tier should remain eligible")
-	assert.False(t, candidates.Has("a3-hypercluster"),
-		"A3 must not cross the hypernode boundary into hypercluster")
-	assert.True(t, candidates.Has("a5-hypernode"),
-		"A5 must allow its tier-2 hypernode even though A3 uses tier 1 for the same tier name")
-	assert.True(t, candidates.Has("a5-superpod-0"), "A5 descendants below the boundary should remain eligible")
-	assert.False(t, candidates.Has("a5-hypercluster"),
-		"A5 must not cross the hypernode boundary into hypercluster")
+	assert.True(t, candidates.Has("shallow-hypernode-0"), "shallow hypernode tier should remain eligible")
+	assert.False(t, candidates.Has("shallow-hypercluster"),
+		"shallow must not cross the hypernode boundary into hypercluster")
+	assert.True(t, candidates.Has("deep-hypernode"),
+		"deep must allow its tier-2 hypernode even though shallow uses tier 1 for the same tier name")
+	assert.True(t, candidates.Has("deep-superpod-0"), "deep descendants below the boundary should remain eligible")
+	assert.False(t, candidates.Has("deep-hypercluster"),
+		"deep must not cross the hypernode boundary into hypercluster")
 	assert.Equal(t, [][]string{
-		{"a3-hypernode-0", "a3-hypernode-1"},
-		{"a5-superpod-0", "a5-superpod-1"},
-		{"a5-hypernode"},
+		{"deep-superpod-0", "deep-superpod-1"},
+		{"deep-hypernode"},
+		{"shallow-hypernode-0", "shallow-hypernode-1"},
 	}, gradientNames(gradients), "each tree should contribute its own ascending local-tier gradients")
 
 	t.Run("numeric tiers remain isolated by real tree", func(t *testing.T) {
@@ -3657,10 +3658,10 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
 		assert.NoError(t, err)
 		assert.Equal(t, [][]string{
-			{"a3-hypernode-0", "a3-hypernode-1"},
-			{"a3-hypercluster"},
-			{"a5-superpod-0", "a5-superpod-1"},
-			{"a5-hypernode"},
+			{"deep-superpod-0", "deep-superpod-1"},
+			{"deep-hypernode"},
+			{"shallow-hypernode-0", "shallow-hypernode-1"},
+			{"shallow-hypercluster"},
 		}, gradientNames(gradients))
 	})
 
@@ -3683,22 +3684,22 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 		positions := map[string]int{}
 		position := 0
 		for _, gradient := range gradients {
-			containsA3 := false
-			containsA5 := false
+			containsShallow := false
+			containsDeep := false
 			for _, hyperNode := range gradient {
-				containsA3 = containsA3 || strings.HasPrefix(hyperNode.Name, "a3-")
-				containsA5 = containsA5 || strings.HasPrefix(hyperNode.Name, "a5-")
+				containsShallow = containsShallow || strings.HasPrefix(hyperNode.Name, "shallow-")
+				containsDeep = containsDeep || strings.HasPrefix(hyperNode.Name, "deep-")
 				positions[hyperNode.Name] = position
 				position++
 			}
-			assert.False(t, containsA3 && containsA5, "local tiers from separate real trees must not be merged")
+			assert.False(t, containsShallow && containsDeep, "local tiers from separate real trees must not be merged")
 		}
 		assert.Len(t, positions, len(hyperNodes)-1, "the virtual root is outside the hard boundary")
-		assert.Less(t, positions["a3-hypercluster"], positions["a3-hypernode-0"])
-		assert.Less(t, positions["a3-hypercluster"], positions["a3-hypernode-1"])
-		assert.Less(t, positions["a5-hypercluster"], positions["a5-hypernode"])
-		assert.Less(t, positions["a5-hypernode"], positions["a5-superpod-0"])
-		assert.Less(t, positions["a5-hypernode"], positions["a5-superpod-1"])
+		assert.Less(t, positions["shallow-hypercluster"], positions["shallow-hypernode-0"])
+		assert.Less(t, positions["shallow-hypercluster"], positions["shallow-hypernode-1"])
+		assert.Less(t, positions["deep-hypercluster"], positions["deep-hypernode"])
+		assert.Less(t, positions["deep-hypernode"], positions["deep-superpod-0"])
+		assert.Less(t, positions["deep-hypernode"], positions["deep-superpod-1"])
 	})
 
 	t.Run("cluster-top numeric boundary preserves legacy soft fallback", func(t *testing.T) {
@@ -3711,9 +3712,9 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
 		assert.NoError(t, err)
 		assert.Equal(t, [][]string{
-			{"a3-hypernode-0", "a3-hypernode-1", "a5-superpod-0", "a5-superpod-1"},
-			{"a3-hypercluster", "a5-hypernode"},
-			{"a5-hypercluster"},
+			{"deep-superpod-0", "deep-superpod-1", "shallow-hypernode-0", "shallow-hypernode-1"},
+			{"deep-hypernode", "shallow-hypercluster"},
+			{"deep-hypercluster"},
 			{framework.ClusterTopHyperNode},
 		}, gradientNames(gradients))
 	})
@@ -3731,7 +3732,7 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 				futureIdle: api.EmptyResource(),
 			}
 		}
-		plugin.hyperNodeResourceCache["a5-hypercluster"] = &resourceStatus{
+		plugin.hyperNodeResourceCache["deep-hypercluster"] = &resourceStatus{
 			idle:       &api.Resource{MilliCPU: 4},
 			futureIdle: &api.Resource{MilliCPU: 4},
 		}
@@ -3749,7 +3750,7 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", &api.Resource{MilliCPU: 4}, api.PurposeAllocate)
 		assert.NoError(t, err)
 		assert.Equal(t, [][]string{
-			{"a5-hypercluster"},
+			{"deep-hypercluster"},
 			{framework.ClusterTopHyperNode},
 		}, gradientNames(gradients))
 	})
@@ -3823,41 +3824,41 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
 		assert.NoError(t, err)
 		candidates := collectNames(gradients)
-		assert.True(t, candidates.Has("a5-superpod-0"))
-		assert.False(t, candidates.Has("a3-hypernode-0"))
-		assert.False(t, candidates.Has("a3-hypercluster"))
+		assert.True(t, candidates.Has("deep-superpod-0"))
+		assert.False(t, candidates.Has("shallow-hypernode-0"))
+		assert.False(t, candidates.Has("shallow-hypercluster"))
 	})
 
 	t.Run("partially running job resolves boundary from allocated branch", func(t *testing.T) {
 		gradients, err := plugin.hyperNodeGradientFn(
-			ssn, hyperNodes[framework.ClusterTopHyperNode], networkTopology, "a5-superpod-0", nil, api.PurposeAllocate)
+			ssn, hyperNodes[framework.ClusterTopHyperNode], networkTopology, "deep-superpod-0", nil, api.PurposeAllocate)
 		assert.NoError(t, err)
 		assert.Equal(t, [][]string{
-			{"a5-superpod-0", "a5-superpod-1"},
-			{"a5-hypernode"},
+			{"deep-superpod-0", "deep-superpod-1"},
+			{"deep-hypernode"},
 		}, gradientNames(gradients), "a partially running job must remain in the allocated tree")
 		candidates := collectNames(gradients)
-		assert.True(t, candidates.Has("a5-hypernode"))
-		assert.True(t, candidates.Has("a5-superpod-1"))
-		assert.False(t, candidates.Has("a5-hypercluster"))
-		assert.False(t, candidates.Has("a3-hypernode-0"))
+		assert.True(t, candidates.Has("deep-hypernode"))
+		assert.True(t, candidates.Has("deep-superpod-1"))
+		assert.False(t, candidates.Has("deep-hypercluster"))
+		assert.False(t, candidates.Has("shallow-hypernode-0"))
 	})
 
 	t.Run("real shared root keeps branch-local boundaries", func(t *testing.T) {
 		originalTop := hyperNodes[framework.ClusterTopHyperNode]
-		originalA3Parent := hyperNodes["a3-hypercluster"].Parent
-		originalA5Parent := hyperNodes["a5-hypercluster"].Parent
+		originalShallowParent := hyperNodes["shallow-hypercluster"].Parent
+		originalDeepParent := hyperNodes["deep-hypercluster"].Parent
 		hyperNodes["fabric-root"] = newHyperNodeInfo(
-			"fabric-root", 4, "volcano.sh/fabric", "a3-hypercluster", "a5-hypercluster")
+			"fabric-root", 4, "volcano.sh/fabric", "shallow-hypercluster", "deep-hypercluster")
 		hyperNodes[framework.ClusterTopHyperNode] = newHyperNodeInfo(
 			framework.ClusterTopHyperNode, 5, "", "fabric-root")
 		hyperNodes["fabric-root"].Parent = framework.ClusterTopHyperNode
-		hyperNodes["a3-hypercluster"].Parent = "fabric-root"
-		hyperNodes["a5-hypercluster"].Parent = "fabric-root"
+		hyperNodes["shallow-hypercluster"].Parent = "fabric-root"
+		hyperNodes["deep-hypercluster"].Parent = "fabric-root"
 		defer func() {
 			hyperNodes[framework.ClusterTopHyperNode] = originalTop
-			hyperNodes["a3-hypercluster"].Parent = originalA3Parent
-			hyperNodes["a5-hypercluster"].Parent = originalA5Parent
+			hyperNodes["shallow-hypercluster"].Parent = originalShallowParent
+			hyperNodes["deep-hypercluster"].Parent = originalDeepParent
 			delete(hyperNodes, "fabric-root")
 		}()
 
@@ -3865,11 +3866,11 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 			ssn, hyperNodes[framework.ClusterTopHyperNode], networkTopology, "", nil, api.PurposeAllocate)
 		assert.NoError(t, err)
 		candidates := collectNames(gradients)
-		assert.True(t, candidates.Has("a3-hypernode-0"))
-		assert.True(t, candidates.Has("a5-hypernode"))
+		assert.True(t, candidates.Has("shallow-hypernode-0"))
+		assert.True(t, candidates.Has("deep-hypernode"))
 		assert.False(t, candidates.Has("fabric-root"))
-		assert.False(t, candidates.Has("a3-hypercluster"))
-		assert.False(t, candidates.Has("a5-hypercluster"))
+		assert.False(t, candidates.Has("shallow-hypercluster"))
+		assert.False(t, candidates.Has("deep-hypercluster"))
 	})
 
 	t.Run("missing tier name fails closed", func(t *testing.T) {
@@ -3884,12 +3885,12 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 	})
 
 	t.Run("duplicate tier name in one ancestor chain is rejected", func(t *testing.T) {
-		originalName := hyperNodes["a5-superpod-0"].HyperNode.Spec.TierName
-		hyperNodes["a5-superpod-0"].HyperNode.Spec.TierName = hyperNodeTierName
-		duplicate := api.NewHyperNodeInfo(hyperNodes["a5-superpod-0"].HyperNode, api.ParentOpt("a5-hypernode"))
-		hyperNodes["a5-superpod-0"] = duplicate
+		originalName := hyperNodes["deep-superpod-0"].HyperNode.Spec.TierName
+		hyperNodes["deep-superpod-0"].HyperNode.Spec.TierName = hyperNodeTierName
+		duplicate := api.NewHyperNodeInfo(hyperNodes["deep-superpod-0"].HyperNode, api.ParentOpt("deep-hypernode"))
+		hyperNodes["deep-superpod-0"] = duplicate
 		defer func() {
-			hyperNodes["a5-superpod-0"].HyperNode.Spec.TierName = originalName
+			hyperNodes["deep-superpod-0"].HyperNode.Spec.TierName = originalName
 		}()
 
 		gradients, err := plugin.hyperNodeGradientFn(
@@ -3897,6 +3898,80 @@ func TestHyperNodeGradientWithMixedA3A5Topologies(t *testing.T) {
 		assert.Error(t, err)
 		assert.Nil(t, gradients)
 	})
+}
+
+func TestHyperNodeGradientWithSingleTierTopology(t *testing.T) {
+	const (
+		hyperNodeTierName = "volcano.sh/hypernode"
+		superPodTierName  = "volcano.sh/superpod"
+	)
+	newHyperNodeInfo := func(name string, tier int, tierName string, children ...string) *api.HyperNodeInfo {
+		members := make([]api.MemberConfig, 0, len(children))
+		for _, child := range children {
+			members = append(members, api.MemberConfig{
+				Name:     child,
+				Type:     topologyv1alpha1.MemberTypeHyperNode,
+				Selector: "exact",
+			})
+		}
+		hyperNode := api.BuildHyperNode(name, tier, members)
+		hyperNode.Spec.TierName = tierName
+		info := api.NewHyperNodeInfo(hyperNode)
+		info.Children.Insert(children...)
+		return info
+	}
+
+	hyperNodes := api.HyperNodeInfoMap{
+		"single-tier":    newHyperNodeInfo("single-tier", 1, hyperNodeTierName),
+		"deep-leaf":      newHyperNodeInfo("deep-leaf", 1, superPodTierName),
+		"deep-hypernode": newHyperNodeInfo("deep-hypernode", 2, hyperNodeTierName, "deep-leaf"),
+		"deep-root":      newHyperNodeInfo("deep-root", 3, "volcano.sh/hypercluster", "deep-hypernode"),
+		framework.ClusterTopHyperNode: newHyperNodeInfo(
+			framework.ClusterTopHyperNode, 4, "", "single-tier", "deep-root"),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+
+	plugin := &networkTopologyAwarePlugin{}
+	ssn := &framework.Session{HyperNodes: hyperNodes}
+	topology := &scheduling.NetworkTopologySpec{
+		Mode:            scheduling.HardNetworkTopologyMode,
+		HighestTierName: hyperNodeTierName,
+	}
+	gradientNames := func(gradients [][]*api.HyperNodeInfo) [][]string {
+		result := make([][]string, 0, len(gradients))
+		for _, gradient := range gradients {
+			names := make([]string, 0, len(gradient))
+			for _, hyperNode := range gradient {
+				names = append(names, hyperNode.Name)
+			}
+			result = append(result, names)
+		}
+		return result
+	}
+
+	gradients, err := plugin.hyperNodeGradientFn(
+		ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
+	require.NoError(t, err)
+	assert.Equal(t, [][]string{
+		{"deep-leaf"},
+		{"deep-hypernode"},
+		{"single-tier"},
+	}, gradientNames(gradients),
+		"a one-level tree must contribute its tier-1 candidate without inheriting a sibling tree's depth")
+
+	highestTierAllowed := 1
+	gradients, err = plugin.hyperNodeGradientFn(
+		ssn, hyperNodes[framework.ClusterTopHyperNode], &scheduling.NetworkTopologySpec{
+			Mode:               scheduling.HardNetworkTopologyMode,
+			HighestTierAllowed: &highestTierAllowed,
+		}, "", nil, api.PurposeAllocate)
+	require.NoError(t, err)
+	assert.Equal(t, [][]string{{"deep-leaf"}, {"single-tier"}}, gradientNames(gradients),
+		"numeric tier 1 must be evaluated independently in each real tree")
 }
 
 // TestHyperNodeGradientPreFiltering tests the pre-filtering logic in hyperNodeGradientFn.
@@ -4392,15 +4467,15 @@ func TestNetworkTopologyAwareScoreMixedTreeUsesLocalDepth(t *testing.T) {
 	}
 
 	hyperNodes := api.HyperNodeInfoMap{
-		"a3-leaf-0": newHyperNode("a3-leaf-0", 1),
-		"a3-leaf-1": newHyperNode("a3-leaf-1", 1),
-		"a3-root":   newHyperNode("a3-root", 2, "a3-leaf-0", "a3-leaf-1"),
-		"a5-leaf-0": newHyperNode("a5-leaf-0", 1),
-		"a5-leaf-1": newHyperNode("a5-leaf-1", 1),
-		"a5-middle": newHyperNode("a5-middle", 2, "a5-leaf-0", "a5-leaf-1"),
-		"a5-root":   newHyperNode("a5-root", 3, "a5-middle"),
+		"shallow-leaf-0": newHyperNode("shallow-leaf-0", 1),
+		"shallow-leaf-1": newHyperNode("shallow-leaf-1", 1),
+		"shallow-root":   newHyperNode("shallow-root", 2, "shallow-leaf-0", "shallow-leaf-1"),
+		"deep-leaf-0":    newHyperNode("deep-leaf-0", 1),
+		"deep-leaf-1":    newHyperNode("deep-leaf-1", 1),
+		"deep-middle":    newHyperNode("deep-middle", 2, "deep-leaf-0", "deep-leaf-1"),
+		"deep-root":      newHyperNode("deep-root", 3, "deep-middle"),
 		framework.ClusterTopHyperNode: newHyperNode(
-			framework.ClusterTopHyperNode, 4, "a3-root", "a5-root"),
+			framework.ClusterTopHyperNode, 4, "shallow-root", "deep-root"),
 	}
 	for _, parent := range hyperNodes {
 		for child := range parent.Children {
@@ -4414,12 +4489,12 @@ func TestNetworkTopologyAwareScoreMixedTreeUsesLocalDepth(t *testing.T) {
 	ssn := &framework.Session{HyperNodes: hyperNodes}
 
 	assert.InDelta(t, 0.5,
-		plugin.networkTopologyAwareScore("a3-leaf-1", "a3-leaf-0", ssn), 1e-9,
-		"the deeper A5 tree must not inflate an A3-local LCA score")
+		plugin.networkTopologyAwareScore("shallow-leaf-1", "shallow-leaf-0", ssn), 1e-9,
+		"the deeper deep tree must not inflate a shallow-local LCA score")
 	assert.InDelta(t, 2.0/3.0,
-		plugin.networkTopologyAwareScore("a5-leaf-1", "a5-leaf-0", ssn), 1e-9,
-		"A5 should retain its own three-level distance scale")
+		plugin.networkTopologyAwareScore("deep-leaf-1", "deep-leaf-0", ssn), 1e-9,
+		"deep should retain its own three-level distance scale")
 	assert.Equal(t, ZeroScore,
-		plugin.networkTopologyAwareScore("a5-leaf-0", "a3-leaf-0", ssn),
+		plugin.networkTopologyAwareScore("deep-leaf-0", "shallow-leaf-0", ssn),
 		"nodes in another connected tree must not receive an affinity score")
 }
