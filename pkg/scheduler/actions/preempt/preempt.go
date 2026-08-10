@@ -178,8 +178,6 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 			preemptorJob := preemptors.Pop().(*api.JobInfo)
 
 			stmt := framework.NewStatement(ssn)
-			var assigned bool
-			var err error
 			for {
 				// If job is not request more resource, then stop preempting.
 				if !ssn.JobStarving(preemptorJob) {
@@ -195,7 +193,7 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 
 				preemptor := preemptorTasks[preemptorJob.UID].Pop().(*api.TaskInfo)
 
-				assigned, err = pmpt.preempt(ssn, stmt, preemptor, func(task *api.TaskInfo) bool {
+				_, err := pmpt.preempt(ssn, stmt, preemptor, func(task *api.TaskInfo) bool {
 					// Ignore non running task.
 					if !api.PreemptableStatus(task.Status) {
 						return false
@@ -221,14 +219,14 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 
 			// Commit changes only if job is pipelined, otherwise try next job.
 			if ssn.JobPipelined(preemptorJob) {
+				hasEvictions := stmt.HasEvictions()
 				stmt.Commit()
+				if hasEvictions {
+					metrics.RegisterEvictionTransaction(pmpt.Name())
+				}
 			} else {
 				stmt.Discard()
 				continue
-			}
-
-			if assigned {
-				preemptors.Push(preemptorJob)
 			}
 		}
 
@@ -282,7 +280,11 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 					stmt.Discard()
 					break
 				}
+				hasEvictions := stmt.HasEvictions()
 				stmt.Commit()
+				if hasEvictions {
+					metrics.RegisterEvictionTransaction(pmpt.Name())
+				}
 			}
 		}
 	}
