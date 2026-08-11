@@ -562,15 +562,6 @@ func (ssn *Session) JobStarving(obj interface{}) bool {
 
 // JobValid invoke jobvalid function of the plugins
 func (ssn *Session) JobValid(obj interface{}) *api.ValidateResult {
-	if job, ok := obj.(*api.JobInfo); ok {
-		if err := ssn.validateMixedTopologyMode(job); err != nil {
-			return &api.ValidateResult{
-				Pass:    false,
-				Message: err.Error(),
-			}
-		}
-	}
-
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
 			jrf, found := ssn.jobValidFns[plugin.Name]

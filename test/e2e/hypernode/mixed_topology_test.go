@@ -322,8 +322,6 @@ var _ = Describe("Mixed shallow and deep topology", Serial, func() {
 
 })
 
-// Mixed-topology Soft is intentionally covered by scheduler validation unit tests.
-
 var _ = Describe("Mixed topology profile combinations", Serial, func() {
 	var testCtx *e2eutil.TestContext
 
@@ -879,58 +877,6 @@ func mixedTopologyJobPodsUnbound(
 		}
 	}
 	return controlledPods == expectedPods, nil
-}
-
-func mixedTopologySubGroupProfiles(
-	testCtx *e2eutil.TestContext,
-	job *batchv1alpha1.Job,
-	expectedPartitions, expectedPartitionSize int,
-) (map[string]sets.Set[string], error) {
-	pods := e2eutil.GetTasksOfJob(testCtx, job)
-	expectedPods := expectedPartitions * expectedPartitionSize
-	if len(pods) != expectedPods {
-		return nil, fmt.Errorf("expected %d pods for job %s, got %d", expectedPods, job.Name, len(pods))
-	}
-
-	podCounts := make(map[string]int, expectedPartitions)
-	profilesByPartition := make(map[string]sets.Set[string], expectedPartitions)
-	for _, pod := range pods {
-		partition, found := pod.Labels[batchv1alpha1.TaskPartitionID]
-		if !found || partition == "" {
-			return nil, fmt.Errorf("pod %s/%s has no partition label", pod.Namespace, pod.Name)
-		}
-		if pod.Spec.NodeName == "" {
-			return nil, fmt.Errorf("pod %s/%s is not scheduled", pod.Namespace, pod.Name)
-		}
-
-		node, err := testCtx.Kubeclient.CoreV1().Nodes().Get(
-			context.Background(), pod.Spec.NodeName, metav1.GetOptions{})
-		if err != nil {
-			return nil, err
-		}
-		profile := node.Labels[mixedProfileLabel]
-		if profile != "shallow" && profile != "deep" {
-			return nil, fmt.Errorf("pod %s/%s is on node %s with unexpected profile %q",
-				pod.Namespace, pod.Name, node.Name, profile)
-		}
-		if profilesByPartition[partition] == nil {
-			profilesByPartition[partition] = sets.New[string]()
-		}
-		profilesByPartition[partition].Insert(profile)
-		podCounts[partition]++
-	}
-
-	for partitionIndex := 0; partitionIndex < expectedPartitions; partitionIndex++ {
-		partition := fmt.Sprint(partitionIndex)
-		if podCounts[partition] != expectedPartitionSize {
-			return nil, fmt.Errorf("partition %s has %d pods, expected %d",
-				partition, podCounts[partition], expectedPartitionSize)
-		}
-	}
-	if len(profilesByPartition) != expectedPartitions {
-		return nil, fmt.Errorf("found unexpected partitions: %v", sets.KeySet(profilesByPartition).UnsortedList())
-	}
-	return profilesByPartition, nil
 }
 
 func mixedTopologySubGroupDomains(

@@ -3702,23 +3702,6 @@ func TestHyperNodeGradientWithMixedDepthTopologies(t *testing.T) {
 		assert.Less(t, positions["deep-hypernode"], positions["deep-superpod-1"])
 	})
 
-	t.Run("cluster-top numeric boundary remains tree-local for mixed Hard", func(t *testing.T) {
-		highestTierAllowed := hyperNodes[framework.ClusterTopHyperNode].Tier()
-		topology := &scheduling.NetworkTopologySpec{
-			Mode:               scheduling.HardNetworkTopologyMode,
-			HighestTierAllowed: &highestTierAllowed,
-		}
-		gradients, err := plugin.hyperNodeGradientFn(
-			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
-		assert.NoError(t, err)
-		assert.Equal(t, [][]string{
-			{"deep-superpod-0", "deep-superpod-1"},
-			{"deep-hypernode"},
-			{"deep-hypercluster"},
-			{"shallow-hypernode-0", "shallow-hypernode-1"},
-			{"shallow-hypercluster"},
-		}, gradientNames(gradients))
-	})
 	t.Run("branch without requested tier name is excluded", func(t *testing.T) {
 		topology := &scheduling.NetworkTopologySpec{
 			Mode:            scheduling.HardNetworkTopologyMode,
