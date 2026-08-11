@@ -74,6 +74,138 @@ func TestSessionEnsureTopologyTrees(t *testing.T) {
 	assert.Empty(t, ssn.FindHyperNodeForNode("outside-node"))
 }
 
+func topologySessionForTest(layouts ...[]string) *Session {
+	hyperNodes := api.HyperNodeInfoMap{}
+	realNodes := map[string]sets.Set[string]{}
+	rootNames := make([]string, 0, len(layouts))
+	maxTier := 0
+
+	for treeIndex, layout := range layouts {
+		previous := ""
+		for tierIndex, tierName := range layout {
+			name := fmt.Sprintf("tree-%d-tier-%d", treeIndex, tierIndex+1)
+			hyperNode := &topologyv1alpha1.HyperNode{}
+			hyperNode.Name = name
+			hyperNode.Spec.Tier = tierIndex + 1
+			hyperNode.Spec.TierName = tierName
+			info := api.NewHyperNodeInfo(hyperNode)
+			if previous != "" {
+				info.Children.Insert(previous)
+				hyperNodes[previous].Parent = name
+			}
+			hyperNodes[name] = info
+			realNodes[name] = sets.New(fmt.Sprintf("node-%d-%d", treeIndex, tierIndex))
+			previous = name
+		}
+		if previous != "" {
+			rootNames = append(rootNames, previous)
+		}
+		if len(layout) > maxTier {
+			maxTier = len(layout)
+		}
+	}
+
+	clusterRoot := &topologyv1alpha1.HyperNode{}
+	clusterRoot.Name = ClusterTopHyperNode
+	clusterRoot.Spec.Tier = maxTier + 1
+	clusterInfo := api.NewHyperNodeInfo(clusterRoot)
+	for _, root := range rootNames {
+		clusterInfo.Children.Insert(root)
+		hyperNodes[root].Parent = ClusterTopHyperNode
+	}
+	hyperNodes[ClusterTopHyperNode] = clusterInfo
+	realNodes[ClusterTopHyperNode] = sets.New[string]()
+
+	ssn := &Session{HyperNodes: hyperNodes, RealNodesSet: realNodes}
+	ssn.EnsureTopologyTrees()
+	return ssn
+}
+
+func TestSessionHasMixedTopologySemantics(t *testing.T) {
+	tests := []struct {
+		name    string
+		layouts [][]string
+		mixed   bool
+	}{
+		{name: "one root", layouts: [][]string{{"shared", "root"}}, mixed: false},
+		{name: "same signature roots", layouts: [][]string{{"shared", "root"}, {"shared", "root"}}, mixed: false},
+		{name: "different depth", layouts: [][]string{{"shared", "root"}, {"leaf", "shared", "root"}}, mixed: true},
+		{name: "different semantic layout", layouts: [][]string{{"rack", "zone"}, {"switch", "pod"}}, mixed: true},
+		{name: "single tier and multi tier", layouts: [][]string{{"rack"}, {"rack", "zone"}}, mixed: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.mixed, topologySessionForTest(tt.layouts...).HasMixedTopologySemantics())
+		})
+	}
+}
+
+func TestSessionMixedTopologySoftValidation(t *testing.T) {
+	soft := func() *scheduling.NetworkTopologySpec {
+		return &scheduling.NetworkTopologySpec{Mode: scheduling.SoftNetworkTopologyMode}
+	}
+	hard := func() *scheduling.NetworkTopologySpec {
+		return &scheduling.NetworkTopologySpec{
+			Mode:            scheduling.HardNetworkTopologyMode,
+			HighestTierName: "root",
+		}
+	}
+	newJob := func(jobTopology, subJobTopology *scheduling.NetworkTopologySpec) *api.JobInfo {
+		job := api.NewJobInfo("test-job")
+		job.SetPodGroup(&api.PodGroup{PodGroup: scheduling.PodGroup{
+			Spec: scheduling.PodGroupSpec{NetworkTopology: jobTopology},
+		}})
+		if subJobTopology != nil {
+			job.SubJobs["test-subjob"] = api.NewSubJobInfo(
+				"test-subgroup", "test-subjob", job.UID,
+				&scheduling.SubGroupPolicySpec{NetworkTopology: subJobTopology}, nil)
+		}
+		return job
+	}
+
+	tests := []struct {
+		name        string
+		layouts     [][]string
+		jobSpec     *scheduling.NetworkTopologySpec
+		subJobSpec  *scheduling.NetworkTopologySpec
+		unsupported bool
+		converted   bool
+	}{
+		{name: "mixed job soft", layouts: [][]string{{"shared", "root"}, {"leaf", "shared", "root"}}, jobSpec: soft(), unsupported: true},
+		{name: "mixed hard job soft subgroup", layouts: [][]string{{"shared", "root"}, {"leaf", "shared", "root"}}, jobSpec: hard(), subJobSpec: soft(), unsupported: true},
+		{name: "mixed soft job hard subgroup", layouts: [][]string{{"shared", "root"}, {"leaf", "shared", "root"}}, jobSpec: soft(), subJobSpec: hard(), unsupported: true},
+		{name: "mixed both soft", layouts: [][]string{{"shared", "root"}, {"leaf", "shared", "root"}}, jobSpec: soft(), subJobSpec: soft(), unsupported: true},
+		{name: "mixed all hard", layouts: [][]string{{"shared", "root"}, {"leaf", "shared", "root"}}, jobSpec: hard(), subJobSpec: hard()},
+		{name: "same signature roots soft", layouts: [][]string{{"shared", "root"}, {"shared", "root"}}, jobSpec: soft(), converted: true},
+		{name: "single topology soft", layouts: [][]string{{"shared", "root"}}, jobSpec: soft(), converted: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ssn := topologySessionForTest(tt.layouts...)
+			job := newJob(tt.jobSpec, tt.subJobSpec)
+			ssn.Jobs = map[api.JobID]*api.JobInfo{job.UID: job}
+			ssn.adjustNetworkTopologySpec()
+
+			result := ssn.JobValid(job)
+			if tt.unsupported {
+				if assert.NotNil(t, result) {
+					assert.False(t, result.Pass)
+					assert.Equal(t, mixedTopologySoftUnsupportedMessage, result.Message)
+				}
+				assert.True(t, job.IsSoftTopologyMode() || job.SubJobs["test-subjob"].IsSoftTopologyMode())
+				return
+			}
+
+			assert.Nil(t, result)
+			if tt.converted {
+				assert.Equal(t, scheduling.HardNetworkTopologyMode, job.NetworkTopology.Mode)
+			}
+		})
+	}
+}
+
 func TestSessionRecoverAllocatedHyperNodeAcrossMixedTopology(t *testing.T) {
 	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
 		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))

@@ -23,6 +23,7 @@ limitations under the License.
 package framework
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"sort"
@@ -71,6 +72,11 @@ type TopologyTree struct {
 	ByTier     map[int]sets.Set[string]
 	Tiers      []int
 	RealNodes  sets.Set[string]
+}
+
+type topologyLevelSignature struct {
+	Tier      int
+	TierNames []string
 }
 
 // Session information for the current session
@@ -499,6 +505,69 @@ func (ssn *Session) addTopologyTree(root string) {
 	}
 	sort.Ints(tree.Tiers)
 	ssn.TopologyTrees[root] = tree
+}
+
+// HasMixedTopologySemantics reports whether the session contains topology
+// trees with different local tier/name layouts. Multiple physical roots with
+// the same layout are one topology model and do not make the session mixed.
+func (ssn *Session) HasMixedTopologySemantics() bool {
+	ssn.EnsureTopologyTrees()
+
+	var reference []topologyLevelSignature
+	first := true
+	roots := make([]string, 0, len(ssn.TopologyTrees))
+	for root := range ssn.TopologyTrees {
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	for _, root := range roots {
+		signature := ssn.topologyTreeSignature(ssn.TopologyTrees[root])
+		if first {
+			reference = signature
+			first = false
+			continue
+		}
+		if !equalTopologySignatures(reference, signature) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ssn *Session) topologyTreeSignature(tree *TopologyTree) []topologyLevelSignature {
+	if tree == nil {
+		return nil
+	}
+	signature := make([]topologyLevelSignature, 0, len(tree.Tiers))
+	for _, tier := range tree.Tiers {
+		tierNames := sets.New[string]()
+		for hyperNode := range tree.ByTier[tier] {
+			if info, found := ssn.HyperNodes[hyperNode]; found {
+				tierNames.Insert(info.TierName())
+			}
+		}
+		names := tierNames.UnsortedList()
+		sort.Strings(names)
+		signature = append(signature, topologyLevelSignature{Tier: tier, TierNames: names})
+	}
+	return signature
+}
+
+func equalTopologySignatures(left, right []topologyLevelSignature) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].Tier != right[i].Tier || len(left[i].TierNames) != len(right[i].TierNames) {
+			return false
+		}
+		for j := range left[i].TierNames {
+			if left[i].TierNames[j] != right[i].TierNames[j] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // removeInvalidAllocatedHyperNode removes the non-existent allocated hyperNode for job and subJobs in the job.
@@ -1226,9 +1295,30 @@ func (ssn *Session) IsJobTerminated(jobId api.JobID) bool {
 	return ssn.cache.IsJobTerminated(jobId)
 }
 
-// adjustNetworkTopologySpec converts soft topology mode to hard mode with
-// ClusterTopHyperNode tier as maxTier. Hard highestTierName constraints stay
-// intact so plugins can resolve them independently in each topology branch.
+const mixedTopologySoftUnsupportedMessage = "soft topology scheduling is not supported for mixed topology models"
+
+// validateMixedTopologyMode rejects Soft constraints only when topology trees
+// have different semantic layouts. The original Soft mode remains available
+// for a single or homogeneous topology model.
+func (ssn *Session) validateMixedTopologyMode(job *api.JobInfo) error {
+	if job == nil || !ssn.HasMixedTopologySemantics() {
+		return nil
+	}
+	if job.IsSoftTopologyMode() {
+		return errors.New(mixedTopologySoftUnsupportedMessage)
+	}
+	for _, subJob := range job.SubJobs {
+		if subJob.IsSoftTopologyMode() {
+			return errors.New(mixedTopologySoftUnsupportedMessage)
+		}
+	}
+	return nil
+}
+
+// adjustNetworkTopologySpec converts supported Soft topology mode to Hard mode
+// with ClusterTopHyperNode tier as maxTier. Hard highestTierName constraints
+// stay intact so plugins can resolve them independently in each topology
+// branch. Mixed-topology Soft jobs are left unchanged for JobValid to reject.
 func (ssn *Session) adjustNetworkTopologySpec() {
 	// Convert soft topology to hard topology with ClusterTopHyperNode tier as maxTier,
 	// so that soft-mode jobs reuse the hard-mode scheduling path without any HyperNode filtering.
@@ -1239,6 +1329,11 @@ func (ssn *Session) adjustNetworkTopologySpec() {
 	maxTier := clusterTopHyperNode.Tier()
 	for _, job := range ssn.Jobs {
 		if !job.ContainsNetworkTopology() {
+			continue
+		}
+		if err := ssn.validateMixedTopologyMode(job); err != nil {
+			klog.V(3).InfoS("Skipping Soft topology conversion for unsupported mixed topology job",
+				"job", job.UID, "reason", err)
 			continue
 		}
 		convertSoftToHardTopology(job, maxTier)

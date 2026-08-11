@@ -648,7 +648,7 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 // hyperNodeGradientFn computes network topology gradients by performing BFS traversal from the given HyperNode,
 // filtering and grouping HyperNodes by tier based on resource availability and topology constraints.
 // Each real tree is returned as a contiguous sequence of ascending local-tier gradients; real trees are ordered
-// by root name. A cluster-top numeric boundary retains the legacy cluster-wide tier grouping used by soft mode.
+// by root name. Non-mixed topologies retain the legacy cluster-wide traversal for a cluster-top numeric boundary.
 //
 // Parameters:
 //   - ssn: scheduling session containing all HyperNode information and cluster state
@@ -667,10 +667,10 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 		return nil, fmt.Errorf("getSearchRoot failed: %w", err)
 	}
 
-	// Soft topology is currently converted to a numeric hard constraint at
-	// ClusterTopHyperNode. Keep the existing cluster-wide tier grouping
-	// until soft topology gets its own tree-aware placement policy.
-	if searchRoot.Name == framework.ClusterTopHyperNode && topology.HighestTierAllowed != nil &&
+	// Preserve the upstream single/homogeneous-topology path. Mixed topology
+	// numeric Hard constraints remain tree-local, while mixed Soft is rejected
+	// before conversion and never reaches this fallback.
+	if !ssn.HasMixedTopologySemantics() && searchRoot.Name == framework.ClusterTopHyperNode && topology.HighestTierAllowed != nil &&
 		*topology.HighestTierAllowed >= searchRoot.Tier() {
 		result, _, err := nta.hyperNodeGradientsForSubtree(
 			ssn, searchRoot, topology, allocatedHyperNode, minResource, purpose)

@@ -3702,7 +3702,7 @@ func TestHyperNodeGradientWithMixedDepthTopologies(t *testing.T) {
 		assert.Less(t, positions["deep-hypernode"], positions["deep-superpod-1"])
 	})
 
-	t.Run("cluster-top numeric boundary preserves legacy soft fallback", func(t *testing.T) {
+	t.Run("cluster-top numeric boundary remains tree-local for mixed Hard", func(t *testing.T) {
 		highestTierAllowed := hyperNodes[framework.ClusterTopHyperNode].Tier()
 		topology := &scheduling.NetworkTopologySpec{
 			Mode:               scheduling.HardNetworkTopologyMode,
@@ -3712,109 +3712,13 @@ func TestHyperNodeGradientWithMixedDepthTopologies(t *testing.T) {
 			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", nil, api.PurposeAllocate)
 		assert.NoError(t, err)
 		assert.Equal(t, [][]string{
-			{"deep-superpod-0", "deep-superpod-1", "shallow-hypernode-0", "shallow-hypernode-1"},
-			{"deep-hypernode", "shallow-hypercluster"},
+			{"deep-superpod-0", "deep-superpod-1"},
+			{"deep-hypernode"},
 			{"deep-hypercluster"},
-			{framework.ClusterTopHyperNode},
+			{"shallow-hypernode-0", "shallow-hypernode-1"},
+			{"shallow-hypercluster"},
 		}, gradientNames(gradients))
 	})
-
-	t.Run("converted soft tries a feasible real tree before the virtual root", func(t *testing.T) {
-		originalCache := plugin.hyperNodeResourceCache
-		defer func() {
-			plugin.hyperNodeResourceCache = originalCache
-		}()
-
-		plugin.hyperNodeResourceCache = make(map[string]*resourceStatus, len(hyperNodes))
-		for name := range hyperNodes {
-			plugin.hyperNodeResourceCache[name] = &resourceStatus{
-				idle:       api.EmptyResource(),
-				futureIdle: api.EmptyResource(),
-			}
-		}
-		plugin.hyperNodeResourceCache["deep-hypercluster"] = &resourceStatus{
-			idle:       &api.Resource{MilliCPU: 4},
-			futureIdle: &api.Resource{MilliCPU: 4},
-		}
-		plugin.hyperNodeResourceCache[framework.ClusterTopHyperNode] = &resourceStatus{
-			idle:       &api.Resource{MilliCPU: 8},
-			futureIdle: &api.Resource{MilliCPU: 8},
-		}
-
-		highestTierAllowed := hyperNodes[framework.ClusterTopHyperNode].Tier()
-		topology := &scheduling.NetworkTopologySpec{
-			Mode:               scheduling.HardNetworkTopologyMode,
-			HighestTierAllowed: &highestTierAllowed,
-		}
-		gradients, err := plugin.hyperNodeGradientFn(
-			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", &api.Resource{MilliCPU: 4}, api.PurposeAllocate)
-		assert.NoError(t, err)
-		assert.Equal(t, [][]string{
-			{"deep-hypercluster"},
-			{framework.ClusterTopHyperNode},
-		}, gradientNames(gradients))
-	})
-
-	t.Run("converted soft falls back to the virtual root for combined capacity", func(t *testing.T) {
-		originalCache := plugin.hyperNodeResourceCache
-		defer func() {
-			plugin.hyperNodeResourceCache = originalCache
-		}()
-
-		plugin.hyperNodeResourceCache = make(map[string]*resourceStatus, len(hyperNodes))
-		for name := range hyperNodes {
-			plugin.hyperNodeResourceCache[name] = &resourceStatus{
-				idle:       api.EmptyResource(),
-				futureIdle: api.EmptyResource(),
-			}
-		}
-		plugin.hyperNodeResourceCache[framework.ClusterTopHyperNode] = &resourceStatus{
-			idle:       &api.Resource{MilliCPU: 8},
-			futureIdle: &api.Resource{MilliCPU: 8},
-		}
-
-		highestTierAllowed := hyperNodes[framework.ClusterTopHyperNode].Tier()
-		topology := &scheduling.NetworkTopologySpec{
-			Mode:               scheduling.HardNetworkTopologyMode,
-			HighestTierAllowed: &highestTierAllowed,
-		}
-		gradients, err := plugin.hyperNodeGradientFn(
-			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", &api.Resource{MilliCPU: 4}, api.PurposeAllocate)
-		assert.NoError(t, err)
-		assert.Equal(t, [][]string{
-			{framework.ClusterTopHyperNode},
-		}, gradientNames(gradients))
-	})
-
-	t.Run("converted soft returns no candidate when total capacity is insufficient", func(t *testing.T) {
-		originalCache := plugin.hyperNodeResourceCache
-		defer func() {
-			plugin.hyperNodeResourceCache = originalCache
-		}()
-
-		plugin.hyperNodeResourceCache = make(map[string]*resourceStatus, len(hyperNodes))
-		for name := range hyperNodes {
-			plugin.hyperNodeResourceCache[name] = &resourceStatus{
-				idle:       api.EmptyResource(),
-				futureIdle: api.EmptyResource(),
-			}
-		}
-		plugin.hyperNodeResourceCache[framework.ClusterTopHyperNode] = &resourceStatus{
-			idle:       &api.Resource{MilliCPU: 3},
-			futureIdle: &api.Resource{MilliCPU: 3},
-		}
-
-		highestTierAllowed := hyperNodes[framework.ClusterTopHyperNode].Tier()
-		topology := &scheduling.NetworkTopologySpec{
-			Mode:               scheduling.HardNetworkTopologyMode,
-			HighestTierAllowed: &highestTierAllowed,
-		}
-		gradients, err := plugin.hyperNodeGradientFn(
-			ssn, hyperNodes[framework.ClusterTopHyperNode], topology, "", &api.Resource{MilliCPU: 4}, api.PurposeAllocate)
-		assert.NoError(t, err)
-		assert.Empty(t, gradients, "the virtual root must not fabricate capacity for an unsatisfied gang")
-	})
-
 	t.Run("branch without requested tier name is excluded", func(t *testing.T) {
 		topology := &scheduling.NetworkTopologySpec{
 			Mode:            scheduling.HardNetworkTopologyMode,

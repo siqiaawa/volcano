@@ -162,6 +162,20 @@ unchanged. The mixed-depth profile form is generic: profile names, selectors,
 label keys, and tier names are user-defined and do not imply support for a
 particular accelerator product.
 
+### Mixed topology scheduling scope
+
+When a cluster contains heterogeneous topology trees, topology affinity is
+currently supported in `hard` mode only. A Job or any SubGroup/partition that
+uses `soft` mode is rejected before Soft conversion and remains unschedulable;
+it does not fall back to the virtual cluster root or combine capacity across
+different tree models.
+
+For a single topology model, or for multiple physical roots with the same
+topology signature, Volcano keeps the upstream Soft control flow. This scope
+does not claim to fix the existing Soft scheduling behavior. The scheduler
+determines whether trees are heterogeneous from their local tiers and semantic
+`tierName` layout, not from profile names or accelerator model names.
+
         *       tier2                     s4                                 s5                         
                                   /               \                   /              \                 
                 tier1           s0                s1                 s2              s3              
