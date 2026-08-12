@@ -55,8 +55,8 @@ type HyperNodesInfo struct {
 
 type HyperNodeInfoMap map[string]*HyperNodeInfo
 
-// HyperNodeTierNameMap is kept for compatibility and diagnostics. Scheduling
-// decisions must resolve tier names against each HyperNode branch instead.
+// HyperNodeTierNameMap is kept for compatibility and diagnostics. Tree-aware Hard
+// scheduling must resolve tier names against each HyperNode branch instead.
 type HyperNodeTierNameMap map[string]int
 
 // NewHyperNodesInfo initializes a new HyperNodesInfo instance.

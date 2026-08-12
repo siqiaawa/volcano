@@ -1303,6 +1303,7 @@ func convertSoftToHardTopology(job *api.JobInfo, maxTier int) {
 		job.NetworkTopology.Mode = scheduling.HardNetworkTopologyMode
 		job.NetworkTopology.HighestTierAllowed = &maxTier
 		job.NetworkTopology.HighestTierName = ""
+		job.SetSoftTopologyConverted()
 	}
 
 	// Determine the effective maxTier for SubJob conversion.

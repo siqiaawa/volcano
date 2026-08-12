@@ -57,6 +57,9 @@ type SubJobInfo struct {
 	NominatedHyperNode string
 
 	NetworkTopology *scheduling.NetworkTopologySpec
+	// softTopologyConverted records scheduler-internal Soft-to-Hard conversion
+	// provenance. It is intentionally not part of the Kubernetes-facing API.
+	softTopologyConverted bool
 }
 
 func NewSubJobInfo(gid SubJobGID, uid SubJobID, job JobID, policy *scheduling.SubGroupPolicySpec, matchValues []string) *SubJobInfo {
@@ -115,6 +118,12 @@ func (sji *SubJobInfo) IsSoftTopologyMode() bool {
 	return sji.NetworkTopology.Mode == scheduling.SoftNetworkTopologyMode
 }
 
+// IsSoftTopologyConverted reports whether this subJob's Hard constraint
+// originated from scheduler Soft-to-Hard conversion.
+func (sji *SubJobInfo) IsSoftTopologyConverted() bool {
+	return sji.softTopologyConverted
+}
+
 // WithNetworkTopology returns whether the subJob has configured network topologies
 func (sji *SubJobInfo) WithNetworkTopology() bool {
 	return sji.NetworkTopology != nil
@@ -130,6 +139,7 @@ func (sji *SubJobInfo) ConvertToHardTopology(maxTier int) {
 	sji.NetworkTopology.Mode = scheduling.HardNetworkTopologyMode
 	sji.NetworkTopology.HighestTierAllowed = &maxTier
 	sji.NetworkTopology.HighestTierName = ""
+	sji.softTopologyConverted = true
 }
 
 func (sji *SubJobInfo) addTask(ti *TaskInfo) {
@@ -290,6 +300,7 @@ func (sji *SubJobInfo) AllocatedTaskNum() int32 {
 func (sji *SubJobInfo) CloneStatusFrom(source *SubJobInfo) {
 	sji.AllocatedHyperNode = source.AllocatedHyperNode
 	sji.NominatedHyperNode = source.NominatedHyperNode
+	sji.softTopologyConverted = source.softTopologyConverted
 }
 
 // GetMinResources The current sub job is constrained to gang scheduling,

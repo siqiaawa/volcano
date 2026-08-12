@@ -294,7 +294,7 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 	ssn.AddHyperNodeGradientForJobFn(nta.Name(), func(job *api.JobInfo, hyperNode *api.HyperNodeInfo, purpose api.SearchPurpose) [][]*api.HyperNodeInfo {
 		if topology := job.HardTopologyConstraint(); topology != nil {
 			jobMinResource := job.GetMinResources()
-			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, topology, job.AllocatedHyperNode, jobMinResource, purpose)
+			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, topology, job.AllocatedHyperNode, jobMinResource, purpose, job.IsSoftTopologyConverted())
 			if err != nil {
 				klog.ErrorS(err, "build hyperNode gradient fail", "job", job.UID, "hyperNode", hyperNode.Name,
 					"topology", topology, "allocatedHyperNode", job.AllocatedHyperNode)
@@ -311,7 +311,7 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 	ssn.AddHyperNodeGradientForSubJobFn(nta.Name(), func(subJob *api.SubJobInfo, hyperNode *api.HyperNodeInfo, purpose api.SearchPurpose) [][]*api.HyperNodeInfo {
 		if topology := subJob.HardTopologyConstraint(); topology != nil {
 			subJobMinResource := subJob.GetMinResources()
-			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, topology, subJob.AllocatedHyperNode, subJobMinResource, purpose)
+			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, topology, subJob.AllocatedHyperNode, subJobMinResource, purpose, subJob.IsSoftTopologyConverted())
 			if err != nil {
 				klog.ErrorS(err, "build hyperNode gradient fail", "subJob", subJob.UID, "hyperNode", hyperNode.Name,
 					"topology", topology, "allocatedHyperNode", subJob.AllocatedHyperNode)
@@ -658,26 +658,39 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 //   - allocatedHyperNode: previously allocated HyperNode name for partially running scenarios (empty for initial scheduling)
 //   - minResource: minimum resource requirements for resource pre-filtering (nil to skip resource checks)
 //   - purpose: indicates whether this gradient is used for allocation or eviction
-func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Session, hyperNode *api.HyperNodeInfo, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string, minResource *api.Resource, purpose api.SearchPurpose) ([][]*api.HyperNodeInfo, error) {
+func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Session, hyperNode *api.HyperNodeInfo, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string, minResource *api.Resource, purpose api.SearchPurpose, softConverted ...bool) ([][]*api.HyperNodeInfo, error) {
 	if err := validateTopologyConstraint(topology); err != nil {
 		return nil, err
 	}
 
-	searchRoot, err := getSearchRoot(ssn.HyperNodes, hyperNode, topology, allocatedHyperNode)
+	// Only a constraint converted from upstream Soft mode may recover through
+	// the synthetic cluster root. Native Hard constraints must stay in the real
+	// topology tree that already contains the Job/SubJob allocation.
+	convertedFromSoft := len(softConverted) > 0 && softConverted[0]
+	searchRoot, err := getSearchRoot(ssn.HyperNodes, hyperNode, topology, allocatedHyperNode, convertedFromSoft)
 	if err != nil {
 		return nil, fmt.Errorf("getSearchRoot failed: %w", err)
 	}
-
-	// Preserve the upstream cluster-wide traversal for the virtual root. Soft
-	// topology is converted to this numeric boundary before plugin execution.
+	ssn.EnsureTopologyTrees()
+	// Some upstream unit-test fixtures model HyperNodes only as aggregate
+	// resource sets and do not provide real HyperNodeInfo roots. Preserve the
+	// legacy virtual-root traversal for that neutral shape; real topology trees
+	// always take the tree-local path below.
 	if searchRoot.Name == framework.ClusterTopHyperNode && topology.HighestTierAllowed != nil &&
-		*topology.HighestTierAllowed >= searchRoot.Tier() {
+		*topology.HighestTierAllowed >= searchRoot.Tier() && len(ssn.TopologyTrees) == 0 {
 		result, _, err := nta.hyperNodeGradientsForSubtree(
 			ssn, searchRoot, topology, allocatedHyperNode, minResource, purpose)
 		return result, err
 	}
 
-	ssn.EnsureTopologyTrees()
+	// Preserve the upstream cluster-wide traversal for the virtual root. Soft
+	// topology is converted to this numeric boundary before plugin execution.
+	if convertedFromSoft && searchRoot.Name == framework.ClusterTopHyperNode && topology.HighestTierAllowed != nil &&
+		*topology.HighestTierAllowed >= searchRoot.Tier() {
+		result, _, err := nta.hyperNodeGradientsForSubtree(
+			ssn, searchRoot, topology, allocatedHyperNode, minResource, purpose)
+		return result, err
+	}
 
 	searchRoots := []*api.HyperNodeInfo{searchRoot}
 	if searchRoot.Name == framework.ClusterTopHyperNode {
@@ -823,12 +836,12 @@ func (nta *networkTopologyAwarePlugin) isEligibleHyperNode(hn *api.HyperNodeInfo
 // then **intersects** it with the HyperNode subtree constrained by the external caller(`hyperNodeAvailable`),
 // ensuring that the returned HyperNode subtree satisfies both the Job's(/SubJob's) network topology constraints
 // and the caller's constraints.
-func getSearchRoot(hyperNodes api.HyperNodeInfoMap, hyperNodeAvailable *api.HyperNodeInfo, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string) (*api.HyperNodeInfo, error) {
+func getSearchRoot(hyperNodes api.HyperNodeInfoMap, hyperNodeAvailable *api.HyperNodeInfo, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string, allowClusterTop bool) (*api.HyperNodeInfo, error) {
 	if allocatedHyperNode == "" {
 		return hyperNodeAvailable, nil
 	}
 
-	hyperNodeHighestAllowed, err := getHighestAllowedHyperNode(hyperNodes, topology, allocatedHyperNode)
+	hyperNodeHighestAllowed, err := getHighestAllowedHyperNode(hyperNodes, topology, allocatedHyperNode, allowClusterTop)
 	if err != nil {
 		return nil, fmt.Errorf("get highest allowed hyperNode failed: %w", err)
 	}
@@ -850,7 +863,7 @@ func getSearchRoot(hyperNodes api.HyperNodeInfoMap, hyperNodeAvailable *api.Hype
 		hyperNodeAvailable.Name, hyperNodeHighestAllowed)
 }
 
-func getHighestAllowedHyperNode(hyperNodes api.HyperNodeInfoMap, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string) (string, error) {
+func getHighestAllowedHyperNode(hyperNodes api.HyperNodeInfoMap, topology *scheduling.NetworkTopologySpec, allocatedHyperNode string, allowClusterTop bool) (string, error) {
 	if err := validateTopologyConstraint(topology); err != nil {
 		return "", err
 	}
@@ -881,6 +894,9 @@ func getHighestAllowedHyperNode(hyperNodes api.HyperNodeInfoMap, topology *sched
 
 	ancestors := hyperNodes.GetAncestors(allocatedHyperNode)
 	for _, ancestor := range ancestors {
+		if ancestor == framework.ClusterTopHyperNode && !allowClusterTop {
+			break
+		}
 		hni, ok := hyperNodes[ancestor]
 		if !ok {
 			return "", fmt.Errorf("allocated hyperNode %s ancestor %s not found", allocatedHyperNode, ancestor)

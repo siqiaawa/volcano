@@ -416,9 +416,12 @@ type JobInfo struct {
 
 	AllocatedHyperNode string
 	NetworkTopology    *scheduling.NetworkTopologySpec
-	SubJobs            map[SubJobID]*SubJobInfo
-	TaskToSubJob       map[TaskID]SubJobID
-	MinSubJobs         map[SubJobGID]int32 // key is name of "PodGroup.Spec.SubGroupPolicy", value is minSubGroups
+	// softTopologyConverted records scheduler-internal Soft-to-Hard conversion
+	// provenance. It is intentionally not part of the Kubernetes-facing API.
+	softTopologyConverted bool
+	SubJobs               map[SubJobID]*SubJobInfo
+	TaskToSubJob          map[TaskID]SubJobID
+	MinSubJobs            map[SubJobGID]int32 // key is name of "PodGroup.Spec.SubGroupPolicy", value is minSubGroups
 
 	// All tasks of the Job.
 	TaskStatusIndex       map[TaskStatus]TasksMap
@@ -791,11 +794,12 @@ func (ji *JobInfo) Clone() *JobInfo {
 			return nil
 		}(),
 
-		AllocatedHyperNode: ji.AllocatedHyperNode,
-		NetworkTopology:    cloneNetworkTopology(ji.NetworkTopology),
-		SubJobs:            map[SubJobID]*SubJobInfo{},
-		TaskToSubJob:       map[TaskID]SubJobID{},
-		MinSubJobs:         maps.Clone(ji.MinSubJobs),
+		AllocatedHyperNode:    ji.AllocatedHyperNode,
+		NetworkTopology:       cloneNetworkTopology(ji.NetworkTopology),
+		softTopologyConverted: ji.softTopologyConverted,
+		SubJobs:               map[SubJobID]*SubJobInfo{},
+		TaskToSubJob:          map[TaskID]SubJobID{},
+		MinSubJobs:            maps.Clone(ji.MinSubJobs),
 	}
 
 	ji.CreationTimestamp.DeepCopyInto(&info.CreationTimestamp)
@@ -1326,6 +1330,18 @@ func (ji *JobInfo) IsSoftTopologyMode() bool {
 		return false
 	}
 	return ji.NetworkTopology.Mode == scheduling.SoftNetworkTopologyMode
+}
+
+// SetSoftTopologyConverted records that the scheduler converted this job's
+// Soft topology constraint to Hard for the upstream compatibility path.
+func (ji *JobInfo) SetSoftTopologyConverted() {
+	ji.softTopologyConverted = true
+}
+
+// IsSoftTopologyConverted reports whether this job's Hard constraint originated
+// from scheduler Soft-to-Hard conversion.
+func (ji *JobInfo) IsSoftTopologyConverted() bool {
+	return ji.softTopologyConverted
 }
 
 // WithNetworkTopology returns whether the job has configured network topologies

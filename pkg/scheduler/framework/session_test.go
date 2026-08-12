@@ -74,6 +74,39 @@ func TestSessionEnsureTopologyTrees(t *testing.T) {
 	assert.Empty(t, ssn.FindHyperNodeForNode("outside-node"))
 }
 
+func TestSessionAddClusterTopHyperNodeUsesNumericBoundary(t *testing.T) {
+	newHyperNode := func(name string, tier int) *api.HyperNodeInfo {
+		return api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+	}
+
+	ssn := &Session{
+		HyperNodes: api.HyperNodeInfoMap{
+			"root-a": newHyperNode("root-a", 1),
+			"root-b": newHyperNode("root-b", 3),
+		},
+		HyperNodesSetByTier: map[int]sets.Set[string]{
+			1: sets.New[string]("root-a"),
+			3: sets.New[string]("root-b"),
+		},
+		RealNodesList: map[string][]*api.NodeInfo{},
+		RealNodesSet:  map[string]sets.Set[string]{},
+	}
+	nodes := []*api.NodeInfo{{Name: "node-a"}}
+
+	ssn.addClusterTopHyperNode(nodes)
+
+	topHn := ssn.HyperNodes[ClusterTopHyperNode]
+	if assert.NotNil(t, topHn) {
+		assert.Equal(t, 4, topHn.Tier(), "virtual root must be one tier above the highest real tier")
+		assert.Equal(t, sets.New[string]("root-a", "root-b"), topHn.Children)
+	}
+	assert.Equal(t, ClusterTopHyperNode, ssn.HyperNodes["root-a"].Parent)
+	assert.Equal(t, ClusterTopHyperNode, ssn.HyperNodes["root-b"].Parent)
+	assert.Equal(t, sets.New[string](ClusterTopHyperNode), ssn.HyperNodesSetByTier[4])
+	assert.Equal(t, nodes, ssn.RealNodesList[ClusterTopHyperNode])
+	assert.Equal(t, sets.New[string]("node-a"), ssn.RealNodesSet[ClusterTopHyperNode])
+}
+
 func TestSessionRecoverAllocatedHyperNodeAcrossMixedTopology(t *testing.T) {
 	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
 		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
@@ -874,6 +907,34 @@ func TestAdjustNetworkTopologySpec_SoftToHardConversion(t *testing.T) {
 			assert.Equal(t, tt.wantJobName, gotJob.NetworkTopology.HighestTierName, "job tier name mismatch")
 		})
 	}
+}
+
+func TestAdjustNetworkTopologySpecRecordsSoftConversionProvenance(t *testing.T) {
+	maxTier := 2
+	topHn := &topologyv1alpha1.HyperNode{}
+	topHn.Name = ClusterTopHyperNode
+	topHn.Spec.Tier = maxTier
+
+	job := api.NewJobInfo("soft-provenance")
+	job.PodGroup = &api.PodGroup{PodGroup: scheduling.PodGroup{Spec: scheduling.PodGroupSpec{
+		NetworkTopology: &scheduling.NetworkTopologySpec{Mode: scheduling.SoftNetworkTopologyMode},
+	}}}
+	job.NetworkTopology = job.PodGroup.Spec.NetworkTopology.DeepCopy()
+	job.SubJobs[api.SubJobID("soft-provenance/default")] = &api.SubJobInfo{
+		UID:             api.SubJobID("soft-provenance/default"),
+		NetworkTopology: &scheduling.NetworkTopologySpec{Mode: scheduling.SoftNetworkTopologyMode},
+	}
+
+	ssn := &Session{
+		Jobs: map[api.JobID]*api.JobInfo{job.UID: job},
+		HyperNodes: api.HyperNodeInfoMap{
+			ClusterTopHyperNode: api.NewHyperNodeInfo(topHn),
+		},
+	}
+	ssn.adjustNetworkTopologySpec()
+
+	assert.True(t, job.IsSoftTopologyConverted())
+	assert.True(t, job.SubJobs[api.SubJobID("soft-provenance/default")].IsSoftTopologyConverted())
 }
 
 func TestGetPodGroupPhase(t *testing.T) {

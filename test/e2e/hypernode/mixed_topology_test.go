@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 
 	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
@@ -93,7 +94,7 @@ var _ = Describe("Mixed shallow and deep topology", Serial, func() {
 		Eventually(func() (bool, error) {
 			return mixedTopologyHasExpectedGraph(testCtx)
 		}, 60*time.Second, time.Second).Should(BeTrue(),
-			"shallow and deep should remain separate complete trees even when their roots share one label key/value")
+			"shallow and deep should remain separate complete trees while using the same semantic root tier name")
 		deepSnapshot, err := mixedTopologyProfileSnapshot(testCtx, "topologydeep")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(deepSnapshot).To(HaveLen(4))
@@ -318,6 +319,61 @@ var _ = Describe("Mixed shallow and deep topology", Serial, func() {
 		domainsAfterRestart, err := mixedTopologySubGroupDomains(testCtx, job, "deep", mixedDeepSuperPodLabel, 2, 2)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(domainsAfterRestart).To(Equal(domainsBefore))
+	})
+
+	It("keeps a native hard numeric boundary in its real tree across scheduler recovery", func() {
+		controllerConfigMap, err := findControllerConfigMap(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		originalControllerConfig := controllerConfigMap.Data["volcano-controller.conf"]
+
+		originalNodes, err := labelMixedTopologyNodes(testCtx.Kubeclient)
+		Expect(err).NotTo(HaveOccurred())
+		defer func() {
+			Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, originalControllerConfig)).To(Succeed())
+			Expect(restoreNodeLabels(testCtx.Kubeclient, originalNodes)).To(Succeed())
+		}()
+
+		By("enabling shallow and deep topology trees below the numeric cluster boundary")
+		Expect(setControllerConfig(testCtx.Kubeclient, controllerConfigMap, mixedTopologyDiscoveryConfig())).To(Succeed())
+		Eventually(func() (bool, error) {
+			return mixedTopologyHasExpectedTiers(testCtx, 6, "", 2)
+		}, 60*time.Second, time.Second).Should(BeTrue())
+
+		By("forcing the initial native Hard allocation into the shallow real tree")
+		deepBlockers := createMixedTopologyBlockers(testCtx, "mixed-numeric-recovery-blocker", []int{4, 5, 6, 7})
+		defer func() {
+			if len(deepBlockers) > 0 {
+				deleteMixedTopologyBlockers(testCtx, deepBlockers)
+			}
+		}()
+		job := createMixedTopologyNumericHardJob(testCtx, "mixed-hard-numeric-recovery", 4, 2)
+		defer e2eutil.DeleteJob(testCtx, job)
+		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
+		hasShallow, hasDeep, err := mixedTopologyJobUsesProfiles(testCtx, job)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasShallow).To(BeTrue())
+		Expect(hasDeep).To(BeFalse())
+		domainsBefore, err := mixedTopologyJobDomains(testCtx, job, mixedShallowDomainLabel)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(domainsBefore).To(HaveLen(1))
+
+		By("making the sibling deep tree feasible before restarting the scheduler")
+		deleteMixedTopologyBlockers(testCtx, deepBlockers)
+		deepBlockers = nil
+		Expect(restartVolcanoScheduler(testCtx.Kubeclient)).To(Succeed())
+
+		By("replacing a pod after in-memory allocation state has been reconstructed")
+		Expect(replaceMixedTopologyJobPod(testCtx, job, "", 2)).To(Succeed())
+		Expect(e2eutil.WaitJobReady(testCtx, job)).NotTo(HaveOccurred())
+
+		By("verifying the replacement cannot escape to the now-feasible sibling tree")
+		hasShallow, hasDeep, err = mixedTopologyJobUsesProfiles(testCtx, job)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasShallow).To(BeTrue())
+		Expect(hasDeep).To(BeFalse())
+		domainsAfter, err := mixedTopologyJobDomains(testCtx, job, mixedShallowDomainLabel)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(domainsAfter).To(Equal(domainsBefore))
 	})
 
 })
@@ -807,6 +863,29 @@ func createMixedTopologyHardJob(
 	})
 }
 
+func createMixedTopologyNumericHardJob(
+	testCtx *e2eutil.TestContext,
+	name string,
+	highestTierAllowed int,
+	replicas int32,
+) *batchv1alpha1.Job {
+	return e2eutil.CreateJob(testCtx, &e2eutil.JobSpec{
+		Name: name,
+		NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+			Mode:               batchv1alpha1.HardNetworkTopologyMode,
+			HighestTierAllowed: ptr.To(highestTierAllowed),
+		},
+		Tasks: []e2eutil.TaskSpec{{
+			Name:        "worker",
+			Img:         e2eutil.DefaultNginxImage,
+			Req:         e2eutil.CPU5Mem5,
+			Min:         replicas,
+			Rep:         replicas,
+			Tolerations: mixedTopologyTolerations,
+		}},
+	})
+}
+
 func createMixedTopologyBlockers(testCtx *e2eutil.TestContext, prefix string, nodeIndexes []int) []*v1.Pod {
 	pods := make([]*v1.Pod, 0, len(nodeIndexes))
 	for _, nodeIndex := range nodeIndexes {
@@ -962,11 +1041,14 @@ func replaceMixedTopologyJobPod(
 			continue
 		}
 		initialUIDs.Insert(string(pod.UID))
-		if victim == nil && pod.Labels[batchv1alpha1.TaskPartitionID] == partition {
+		if victim == nil && (partition == "" || pod.Labels[batchv1alpha1.TaskPartitionID] == partition) {
 			victim = pod.DeepCopy()
 		}
 	}
 	if victim == nil {
+		if partition == "" {
+			return fmt.Errorf("job %s has no controlled pod", job.Name)
+		}
 		return fmt.Errorf("job %s has no pod in partition %s", job.Name, partition)
 	}
 	if len(initialUIDs) != expectedPods {

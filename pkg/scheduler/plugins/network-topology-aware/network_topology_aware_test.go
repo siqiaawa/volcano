@@ -3787,6 +3787,147 @@ func TestHyperNodeGradientWithMixedDepthTopologies(t *testing.T) {
 	})
 }
 
+func TestHyperNodeGradientHardNumericClusterBoundaryIsTreeLocal(t *testing.T) {
+	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
+		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+		info.Children.Insert(children...)
+		return info
+	}
+
+	const (
+		shallowRoot = "shallow-root"
+		deepRoot    = "deep-root"
+	)
+	clusterRoot := framework.ClusterTopHyperNode
+	hyperNodes := api.HyperNodeInfoMap{
+		shallowRoot: newHyperNode(shallowRoot, 1),
+		deepRoot:    newHyperNode(deepRoot, 1),
+		clusterRoot: newHyperNode(clusterRoot, 2, shallowRoot, deepRoot),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+
+	ssn := &framework.Session{
+		HyperNodes: hyperNodes,
+		RealNodesSet: map[string]sets.Set[string]{
+			shallowRoot: sets.New[string]("shallow-node"),
+			deepRoot:    sets.New[string]("deep-node"),
+			clusterRoot: sets.New[string]("shallow-node", "deep-node"),
+		},
+	}
+	plugin := &networkTopologyAwarePlugin{
+		hyperNodeResourceCache: map[string]*resourceStatus{
+			shallowRoot: {idle: &api.Resource{MilliCPU: 2000}, futureIdle: &api.Resource{MilliCPU: 2000}},
+			deepRoot:    {idle: &api.Resource{MilliCPU: 2000}, futureIdle: &api.Resource{MilliCPU: 2000}},
+			clusterRoot: {idle: &api.Resource{MilliCPU: 4000}, futureIdle: &api.Resource{MilliCPU: 4000}},
+		},
+	}
+	required := &api.Resource{MilliCPU: 4000}
+	highestTierAllowed := 2
+	topology := &scheduling.NetworkTopologySpec{
+		Mode:               scheduling.HardNetworkTopologyMode,
+		HighestTierAllowed: &highestTierAllowed,
+	}
+
+	gradients, err := plugin.hyperNodeGradientFn(ssn, hyperNodes[clusterRoot], topology, "", required, api.PurposeAllocate)
+	require.NoError(t, err)
+	assert.Empty(t, gradients,
+		"native Hard at the virtual-root numeric boundary must not aggregate sibling tree capacity")
+
+	hardSubJob := &api.SubJobInfo{
+		UID: "hard-subjob",
+		NetworkTopology: &scheduling.NetworkTopologySpec{
+			Mode:               scheduling.HardNetworkTopologyMode,
+			HighestTierAllowed: &highestTierAllowed,
+		},
+	}
+	subJobGradients, err := plugin.hyperNodeGradientFn(
+		ssn, hyperNodes[clusterRoot], hardSubJob.HardTopologyConstraint(), "", required, api.PurposeAllocate, hardSubJob.IsSoftTopologyConverted())
+	require.NoError(t, err)
+	assert.Empty(t, subJobGradients,
+		"native Hard SubJob at the virtual-root numeric boundary must not aggregate sibling tree capacity")
+
+	plugin.hyperNodeResourceCache[deepRoot].idle = &api.Resource{MilliCPU: 4000}
+	plugin.hyperNodeResourceCache[deepRoot].futureIdle = &api.Resource{MilliCPU: 4000}
+	gradients, err = plugin.hyperNodeGradientFn(ssn, hyperNodes[clusterRoot], topology, "", required, api.PurposeAllocate)
+	require.NoError(t, err)
+	assert.Equal(t, [][]*api.HyperNodeInfo{{hyperNodes[deepRoot]}}, gradients,
+		"native Hard must select only the single feasible real topology tree")
+	subJobGradients, err = plugin.hyperNodeGradientFn(
+		ssn, hyperNodes[clusterRoot], hardSubJob.HardTopologyConstraint(), "", required, api.PurposeAllocate, hardSubJob.IsSoftTopologyConverted())
+	require.NoError(t, err)
+	assert.Equal(t, [][]*api.HyperNodeInfo{{hyperNodes[deepRoot]}}, subJobGradients,
+		"native Hard SubJob must select only the single feasible real topology tree")
+
+	gradients, err = plugin.hyperNodeGradientFn(
+		ssn, hyperNodes[clusterRoot], topology, deepRoot, required, api.PurposeAllocate)
+	require.NoError(t, err)
+	assert.Equal(t, [][]*api.HyperNodeInfo{{hyperNodes[deepRoot]}}, gradients,
+		"a partially allocated native Hard Job must remain in its original real topology tree")
+
+	subJobGradients, err = plugin.hyperNodeGradientFn(
+		ssn, hyperNodes[clusterRoot], hardSubJob.HardTopologyConstraint(), deepRoot, required, api.PurposeAllocate, hardSubJob.IsSoftTopologyConverted())
+	require.NoError(t, err)
+	assert.Equal(t, [][]*api.HyperNodeInfo{{hyperNodes[deepRoot]}}, subJobGradients,
+		"a partially allocated native Hard SubJob must remain in its original real topology tree")
+}
+
+func TestHyperNodeGradientConvertedSoftKeepsVirtualRootCompatibility(t *testing.T) {
+	newHyperNode := func(name string, tier int, children ...string) *api.HyperNodeInfo {
+		info := api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+		info.Children.Insert(children...)
+		return info
+	}
+	clusterRoot := framework.ClusterTopHyperNode
+	hyperNodes := api.HyperNodeInfoMap{
+		"tree-a":    newHyperNode("tree-a", 1),
+		"tree-b":    newHyperNode("tree-b", 1),
+		clusterRoot: newHyperNode(clusterRoot, 2, "tree-a", "tree-b"),
+	}
+	for _, parent := range hyperNodes {
+		for child := range parent.Children {
+			hyperNodes[child].Parent = parent.Name
+		}
+	}
+	ssn := &framework.Session{
+		HyperNodes: hyperNodes,
+		RealNodesSet: map[string]sets.Set[string]{
+			"tree-a":    sets.New[string]("node-a"),
+			"tree-b":    sets.New[string]("node-b"),
+			clusterRoot: sets.New[string]("node-a", "node-b"),
+		},
+	}
+	plugin := &networkTopologyAwarePlugin{
+		hyperNodeResourceCache: map[string]*resourceStatus{
+			"tree-a":    {idle: &api.Resource{MilliCPU: 2000}, futureIdle: &api.Resource{MilliCPU: 2000}},
+			"tree-b":    {idle: &api.Resource{MilliCPU: 2000}, futureIdle: &api.Resource{MilliCPU: 2000}},
+			clusterRoot: {idle: &api.Resource{MilliCPU: 4000}, futureIdle: &api.Resource{MilliCPU: 4000}},
+		},
+	}
+	required := &api.Resource{MilliCPU: 4000}
+	subJob := &api.SubJobInfo{
+		UID:             "soft-subjob",
+		NetworkTopology: &scheduling.NetworkTopologySpec{Mode: scheduling.SoftNetworkTopologyMode},
+	}
+	subJob.ConvertToHardTopology(hyperNodes[clusterRoot].Tier())
+	require.True(t, subJob.IsSoftTopologyConverted())
+	require.NotNil(t, subJob.HardTopologyConstraint())
+
+	gradients, err := plugin.hyperNodeGradientFn(ssn, hyperNodes[clusterRoot], subJob.HardTopologyConstraint(), "", required, api.PurposeAllocate, subJob.IsSoftTopologyConverted())
+	require.NoError(t, err)
+	candidates := sets.New[string]()
+	for _, gradient := range gradients {
+		for _, hyperNode := range gradient {
+			candidates.Insert(hyperNode.Name)
+		}
+	}
+	assert.Contains(t, candidates, clusterRoot,
+		"a Soft constraint converted by the framework keeps the legacy virtual-root candidate")
+}
+
 func TestHyperNodeGradientWithSingleTierTopology(t *testing.T) {
 	const (
 		hyperNodeTierName = "volcano.sh/hypernode"
