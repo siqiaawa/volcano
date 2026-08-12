@@ -535,86 +535,98 @@ func (l *labelDiscoverer) generateHyperNodeInfo() (map[string]HyperNodeInfo, err
 	})
 	for _, node := range list {
 		labelMap := node.Labels
-		profile, err := l.profileForNode(node)
+		profiles, err := l.profilesForNode(node)
 		if err != nil {
 			return hyperNodeInfoMap, err
 		}
-		if profile == nil {
+		if len(profiles) == 0 {
 			continue
 		}
 
-		memberName := node.Name
-		for i, level := range profile.levels {
-			value, exists := labelMap[level.NodeLabel]
-			if !exists {
-				if profile.selectorConfigured {
-					return hyperNodeInfoMap, fmt.Errorf("node %s selected by topology profile %s is missing level label %s", node.Name, profile.name, level.NodeLabel)
+		for _, profile := range profiles {
+			memberName := node.Name
+			for i, level := range profile.levels {
+				value, exists := labelMap[level.NodeLabel]
+				if !exists {
+					if profile.selectorConfigured {
+						return hyperNodeInfoMap, fmt.Errorf("node %s selected by topology profile %s is missing level label %s", node.Name, profile.name, level.NodeLabel)
+					}
+					klog.V(5).InfoS("Topology level label does not exist on node", "node", node.Name, "profile", profile.name, "label", level.NodeLabel)
+					break
 				}
-				klog.V(5).InfoS("Topology level label does not exist on node", "node", node.Name, "profile", profile.name, "label", level.NodeLabel)
-				break
-			}
 
-			tier := i + 1
-			cacheKey := domainKey{profile: profile.name, nodeLabel: level.NodeLabel, value: value}
-			hyperNodeName, exists := domainHyperNodeMap[cacheKey]
-			if !exists {
-				hyperNodeName, err = l.buildHyperNodeName(*profile, level.NodeLabel, value, tier, hyperNodeInfoMap)
-				if err != nil {
-					return hyperNodeInfoMap, fmt.Errorf("build HyperNode for profile %s: %w", profile.name, err)
+				tier := i + 1
+				cacheKey := domainKey{profile: profile.name, nodeLabel: level.NodeLabel, value: value}
+				hyperNodeName, exists := domainHyperNodeMap[cacheKey]
+				if !exists {
+					hyperNodeName, err = l.buildHyperNodeName(*profile, level.NodeLabel, value, tier, hyperNodeInfoMap)
+					if err != nil {
+						return hyperNodeInfoMap, fmt.Errorf("build HyperNode for profile %s: %w", profile.name, err)
+					}
+					domainHyperNodeMap[cacheKey] = hyperNodeName
 				}
-				domainHyperNodeMap[cacheKey] = hyperNodeName
-			}
 
-			hyperNodeInfo, exists := hyperNodeInfoMap[hyperNodeName]
-			if !exists {
-				hyperNodeInfo = HyperNodeInfo{
-					tier:     tier,
-					tierName: level.TierName,
-					members:  make([]string, 0),
-					labels: map[string]string{
-						api.NetworkTopologyProfileLabelKey: profile.labelValue,
-						level.NodeLabel:                    value,
-					},
+				hyperNodeInfo, exists := hyperNodeInfoMap[hyperNodeName]
+				if !exists {
+					hyperNodeInfo = HyperNodeInfo{
+						tier:     tier,
+						tierName: level.TierName,
+						members:  make([]string, 0),
+						labels: map[string]string{
+							api.NetworkTopologyProfileLabelKey: profile.labelValue,
+							level.NodeLabel:                    value,
+						},
+					}
 				}
-			}
-			if tier > 1 {
-				if existingParent, exists := parentByHyperNode[memberName]; exists && existingParent != hyperNodeName {
-					return hyperNodeInfoMap, fmt.Errorf("HyperNode %s in profile %s belongs to multiple parents: %s and %s", memberName, profile.name, existingParent, hyperNodeName)
+				if tier > 1 {
+					if existingParent, exists := parentByHyperNode[memberName]; exists && existingParent != hyperNodeName {
+						return hyperNodeInfoMap, fmt.Errorf("HyperNode %s in profile %s belongs to multiple parents: %s and %s", memberName, profile.name, existingParent, hyperNodeName)
+					}
+					parentByHyperNode[memberName] = hyperNodeName
 				}
-				parentByHyperNode[memberName] = hyperNodeName
+				hyperNodeInfo.members = append(hyperNodeInfo.members, memberName)
+				hyperNodeInfoMap[hyperNodeName] = hyperNodeInfo
+				memberName = hyperNodeName
 			}
-			hyperNodeInfo.members = append(hyperNodeInfo.members, memberName)
-			hyperNodeInfoMap[hyperNodeName] = hyperNodeInfo
-			memberName = hyperNodeName
 		}
 	}
-	return hyperNodeInfoMap, err
+	return hyperNodeInfoMap, nil
 }
 
-func (l *labelDiscoverer) profileForNode(node *v1.Node) (*topologyProfile, error) {
-	var matched *topologyProfile
+// profilesForNode gives explicit selectors ownership of a Node. If no
+// explicit selector matches, every matching selector-less legacy topology is
+// returned so the pre-profile multi-topology traversal remains compatible.
+func (l *labelDiscoverer) profilesForNode(node *v1.Node) ([]*topologyProfile, error) {
+	var explicitMatch *topologyProfile
+	legacyMatches := make([]*topologyProfile, 0)
 	for i := range l.topologyProfiles {
 		profile := &l.topologyProfiles[i]
 		if !profile.nodeSelector.Matches(labels.Set(node.Labels)) {
 			continue
 		}
+		if profile.selectorConfigured {
+			if explicitMatch != nil {
+				return nil, fmt.Errorf("node %s matches multiple topology profiles: %s and %s", node.Name, explicitMatch.name, profile.name)
+			}
+			explicitMatch = profile
+			continue
+		}
+
 		// Legacy profiles have no selector. Preserve their partial-level
 		// behavior while requiring at least the first topology label before
 		// treating the node as a profile member.
-		if !profile.selectorConfigured {
-			if len(profile.levels) == 0 {
-				continue
-			}
-			if _, exists := node.Labels[profile.levels[0].NodeLabel]; !exists {
-				continue
-			}
+		if len(profile.levels) == 0 {
+			continue
 		}
-		if matched != nil {
-			return nil, fmt.Errorf("node %s matches multiple topology profiles: %s and %s", node.Name, matched.name, profile.name)
+		if _, exists := node.Labels[profile.levels[0].NodeLabel]; !exists {
+			continue
 		}
-		matched = profile
+		legacyMatches = append(legacyMatches, profile)
 	}
-	return matched, nil
+	if explicitMatch != nil {
+		return []*topologyProfile{explicitMatch}, nil
+	}
+	return legacyMatches, nil
 }
 
 func (l *labelDiscoverer) buildHyperNodeName(profile topologyProfile, key, value string, tier int, hyperNodeInfoMap map[string]HyperNodeInfo) (string, error) {

@@ -827,6 +827,82 @@ func TestGenerateHyperNodesRejectsMultipleProfileMatches(t *testing.T) {
 	assert.Empty(t, infoMap, "an ambiguous node must not publish a partial topology")
 }
 
+func TestGenerateHyperNodesPreservesLegacyMultiTopologyTraversal(t *testing.T) {
+	const (
+		fabricDomain  = "example.com/fabric-domain"
+		storageDomain = "example.com/storage-domain"
+	)
+	cfg := api.DiscoveryConfig{Source: "label", Config: map[string]interface{}{
+		"networkTopologyTypes": map[string]interface{}{
+			"topologyfabric": []interface{}{
+				map[string]interface{}{"nodeLabel": fabricDomain, "tierName": "volcano.sh/fabric"},
+				map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+			},
+			"topologystorage": []interface{}{
+				map[string]interface{}{"nodeLabel": storageDomain, "tierName": "volcano.sh/storage"},
+				map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+			},
+		},
+	}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "multi-network-node", Labels: map[string]string{
+		fabricDomain:  "fabric-a",
+		storageDomain: "storage-a",
+	}}}
+
+	discoverer := newDiscovererForGenerationTest(t, cfg, []*corev1.Node{node})
+	infoMap, err := discoverer.generateHyperNodeInfo()
+	require.NoError(t, err)
+	require.Len(t, infoMap, 2)
+
+	byProfile := make(map[string]*topologyv1alpha1.HyperNode)
+	for _, hyperNode := range discoverer.buildHyperNodes(infoMap) {
+		byProfile[hyperNode.Labels[api.NetworkTopologyProfileLabelKey]] = hyperNode
+		assert.Equal(t, []string{node.Name}, exactMemberNames(hyperNode))
+	}
+	require.Contains(t, byProfile, "topologyfabric")
+	require.Contains(t, byProfile, "topologystorage")
+	assert.Equal(t, "volcano.sh/fabric", byProfile["topologyfabric"].Spec.TierName)
+	assert.Equal(t, "volcano.sh/storage", byProfile["topologystorage"].Spec.TierName)
+}
+
+func TestGenerateHyperNodesExplicitProfileTakesOwnershipOverLegacyFallback(t *testing.T) {
+	const (
+		profileLabel = "example.com/profile"
+		explicitTier = "example.com/explicit-domain"
+		legacyTier   = "example.com/legacy-domain"
+	)
+	cfg := api.DiscoveryConfig{Source: "label", Config: map[string]interface{}{
+		"networkTopologyTypes": map[string]interface{}{
+			"topologyexplicit": map[string]interface{}{
+				"nodeSelector": map[string]interface{}{
+					"matchLabels": map[string]interface{}{profileLabel: "explicit"},
+				},
+				"levels": []interface{}{
+					map[string]interface{}{"nodeLabel": explicitTier, "tierName": "volcano.sh/explicit"},
+					map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+				},
+			},
+			"topologylegacy": []interface{}{
+				map[string]interface{}{"nodeLabel": legacyTier, "tierName": "volcano.sh/legacy"},
+				map[string]interface{}{"nodeLabel": corev1.LabelHostname},
+			},
+		},
+	}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "explicit-node", Labels: map[string]string{
+		profileLabel: "explicit",
+		explicitTier: "explicit-a",
+		legacyTier:   "legacy-a",
+	}}}
+
+	discoverer := newDiscovererForGenerationTest(t, cfg, []*corev1.Node{node})
+	infoMap, err := discoverer.generateHyperNodeInfo()
+	require.NoError(t, err)
+	require.Len(t, infoMap, 1)
+	hyperNodes := discoverer.buildHyperNodes(infoMap)
+	require.Len(t, hyperNodes, 1)
+	assert.Equal(t, "topologyexplicit", hyperNodes[0].Labels[api.NetworkTopologyProfileLabelKey])
+}
+
 func TestGenerateHyperNodesRejectsMultipleParents(t *testing.T) {
 	cfg := api.DiscoveryConfig{Config: map[string]interface{}{
 		"networkTopologyTypes": map[string]interface{}{
