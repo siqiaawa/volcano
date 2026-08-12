@@ -653,8 +653,9 @@ func TestJobInfo_HardTopologyConstraint(t *testing.T) {
 			},
 		},
 		{
-			name:     "hard mode without boundary",
-			topology: &scheduling.NetworkTopologySpec{Mode: scheduling.HardNetworkTopologyMode},
+			name:       "hard mode without boundary",
+			topology:   &scheduling.NetworkTopologySpec{Mode: scheduling.HardNetworkTopologyMode},
+			constraint: true,
 		},
 	}
 

@@ -153,6 +153,48 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestValidateTopologyConstraintRejectsMissingBoundary(t *testing.T) {
+	topology := &scheduling.NetworkTopologySpec{Mode: scheduling.HardNetworkTopologyMode}
+	require.EqualError(t, validateTopologyConstraint(topology), "network topology constraint has no tier boundary")
+}
+
+func TestEmptyHardTopologyConstraintFailsClosedAtHooks(t *testing.T) {
+	schedulerCache := &cache.SchedulerCache{
+		Nodes:             map[string]*api.NodeInfo{},
+		Jobs:              map[api.JobID]*api.JobInfo{},
+		Queues:            map[api.QueueID]*api.QueueInfo{},
+		HyperNodesInfo:    api.NewHyperNodesInfo(nil),
+		InUseNodesInShard: sets.Set[string]{},
+		StatusUpdater:     &util.FakeStatusUpdater{},
+		Recorder:          record.NewFakeRecorder(100),
+	}
+	ssn := framework.OpenSession(schedulerCache, nil, nil)
+	defer framework.CloseSession(ssn)
+
+	root := api.NewHyperNodeInfo(api.BuildHyperNode("root", 1, nil))
+	ssn.HyperNodes = api.HyperNodeInfoMap{root.Name: root}
+	enabled := true
+	ssn.Tiers = []conf.Tier{{Plugins: []conf.PluginOption{{
+		Name:                     PluginName,
+		EnabledHyperNodeGradient: &enabled,
+	}}}}
+
+	plugin, ok := New(framework.Arguments{}).(*networkTopologyAwarePlugin)
+	require.True(t, ok)
+	plugin.OnSessionOpen(ssn)
+
+	emptyHard := &scheduling.NetworkTopologySpec{Mode: scheduling.HardNetworkTopologyMode}
+	job := api.NewJobInfo(api.JobID("empty-hard-job"))
+	job.NetworkTopology = emptyHard.DeepCopy()
+	assert.Nil(t, ssn.HyperNodeGradientForJobFn(job, root, api.PurposeAllocate),
+		"invalid Hard Job topology must not fall back to an unconstrained gradient")
+
+	policy := &scheduling.SubGroupPolicySpec{NetworkTopology: emptyHard.DeepCopy()}
+	subJob := api.NewSubJobInfo("group", "empty-hard-subjob", job.UID, policy, nil)
+	assert.Nil(t, ssn.HyperNodeGradientForSubJobFn(subJob, root, api.PurposeAllocate),
+		"invalid Hard SubJob topology must not fall back to an unconstrained gradient")
+}
+
 func TestReverseAndCapEvictionGradients(t *testing.T) {
 	plugin := &networkTopologyAwarePlugin{maxHyperNodesForEviction: 3}
 	hn := func(name string) *api.HyperNodeInfo { return &api.HyperNodeInfo{Name: name} }

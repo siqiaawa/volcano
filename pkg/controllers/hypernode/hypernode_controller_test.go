@@ -309,7 +309,7 @@ func TestInvalidLabelDiscoveryConfigPreservesLastValidTopology(t *testing.T) {
 		case result := <-manager.ResultChannel():
 			require.Equal(t, "label", result.Source)
 			require.Len(t, result.HyperNodes, 1)
-			require.NoError(t, controller.reconcileTopology(result.Source, result.HyperNodes))
+			require.NoError(t, controller.reconcileTopology(&result))
 			result.Ack()
 			return result.HyperNodes[0].Name
 		case <-time.After(5 * time.Second):
@@ -555,6 +555,62 @@ func TestStaleDiscoveryResultIsAcknowledgedWithoutReconcile(t *testing.T) {
 	<-workerDone
 }
 
+func TestDiscoveryResultBecomingStaleSkipsDeletesAndRetry(t *testing.T) {
+	const source = "label"
+	newHyperNode := func(name string) *topologyv1alpha1.HyperNode {
+		return &topologyv1alpha1.HyperNode{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+				Labels: map[string]string{
+					api.NetworkTopologySourceLabelKey: source,
+				},
+			},
+			Spec: topologyv1alpha1.HyperNodeSpec{Tier: 1},
+		}
+	}
+
+	desired := newHyperNode("desired")
+	obsolete := newHyperNode("obsolete")
+	fakeVcClient := vcclientset.NewSimpleClientset(desired.DeepCopy(), obsolete.DeepCopy())
+	vcInformerFactory := vcinformer.NewSharedInformerFactory(fakeVcClient, 0)
+	hyperNodeInformer := vcInformerFactory.Topology().V1alpha1().HyperNodes()
+	require.NoError(t, hyperNodeInformer.Informer().GetIndexer().Add(desired.DeepCopy()))
+	require.NoError(t, hyperNodeInformer.Informer().GetIndexer().Add(obsolete.DeepCopy()))
+
+	queue := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[*discovery.Result]())
+	defer queue.ShutDown()
+	controller := &hyperNodeController{
+		vcClient:             fakeVcClient,
+		hyperNodeLister:      hyperNodeInformer.Lister(),
+		discoveryResultQueue: queue,
+	}
+
+	var currentChecks atomic.Int32
+	var acknowledgements atomic.Int32
+	result := &discovery.Result{
+		Source:     source,
+		HyperNodes: []*topologyv1alpha1.HyperNode{desired.DeepCopy()},
+		Current: func() bool {
+			return currentChecks.Add(1) == 1
+		},
+		Acknowledge: func() {
+			acknowledgements.Add(1)
+		},
+	}
+	queue.Add(result)
+	require.True(t, controller.processNextDiscoveryResult())
+
+	assert.Equal(t, int32(1), acknowledgements.Load())
+	assert.GreaterOrEqual(t, currentChecks.Load(), int32(2))
+	assert.Zero(t, queue.NumRequeues(result), "stale results must not be rate-limit retried")
+	for _, action := range fakeVcClient.Actions() {
+		assert.NotEqual(t, "delete", action.GetVerb(), "stale reconciliation must stop before deleting HyperNodes")
+	}
+	_, err := fakeVcClient.TopologyV1alpha1().HyperNodes().Get(context.Background(), obsolete.Name, metav1.GetOptions{})
+	assert.NoError(t, err, "obsolete HyperNode must remain when the result becomes stale before deletion")
+}
+
 func TestReconcileTopologyUsesDependencyOrder(t *testing.T) {
 	const source = "label"
 	newHyperNode := func(name string, tier int) *topologyv1alpha1.HyperNode {
@@ -578,7 +634,7 @@ func TestReconcileTopologyUsesDependencyOrder(t *testing.T) {
 			vcClient:        fakeVcClient,
 			hyperNodeLister: vcInformerFactory.Topology().V1alpha1().HyperNodes().Lister(),
 		}
-		require.NoError(t, controller.reconcileTopology(source, desired))
+		require.NoError(t, controller.reconcileTopology(&discovery.Result{Source: source, HyperNodes: desired}))
 
 		var created []string
 		for _, action := range fakeVcClient.Actions() {
@@ -602,7 +658,7 @@ func TestReconcileTopologyUsesDependencyOrder(t *testing.T) {
 			vcClient:        fakeVcClient,
 			hyperNodeLister: hyperNodeInformer.Lister(),
 		}
-		require.NoError(t, controller.reconcileTopology(source, desired))
+		require.NoError(t, controller.reconcileTopology(&discovery.Result{Source: source, HyperNodes: desired}))
 
 		var updated []string
 		for _, action := range fakeVcClient.Actions() {
@@ -626,7 +682,7 @@ func TestReconcileTopologyUsesDependencyOrder(t *testing.T) {
 			vcClient:        fakeVcClient,
 			hyperNodeLister: hyperNodeInformer.Lister(),
 		}
-		require.NoError(t, controller.reconcileTopology(source, []*topologyv1alpha1.HyperNode{}))
+		require.NoError(t, controller.reconcileTopology(&discovery.Result{Source: source, HyperNodes: []*topologyv1alpha1.HyperNode{}}))
 
 		var deleted []string
 		for _, action := range fakeVcClient.Actions() {

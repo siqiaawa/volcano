@@ -648,8 +648,8 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 // hyperNodeGradientFn computes network topology gradients by performing BFS traversal from the given HyperNode,
 // filtering and grouping HyperNodes by tier based on resource availability and topology constraints.
 // Each real tree is returned as a contiguous sequence of ascending local-tier gradients; real trees are ordered
-// by root name. A cluster-top numeric boundary retains the upstream
-// cluster-wide virtual-root traversal.
+// by root name. Only constraints converted from Soft mode and the legacy aggregate-only test fixture retain the
+// upstream cluster-wide virtual-root traversal; native Hard constraints remain tree-local.
 //
 // Parameters:
 //   - ssn: scheduling session containing all HyperNode information and cluster state

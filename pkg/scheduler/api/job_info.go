@@ -1311,14 +1311,11 @@ func (ji *JobInfo) IsHardTopologyMode() (bool, int) {
 	return ji.NetworkTopology.Mode == scheduling.HardNetworkTopologyMode, *ji.NetworkTopology.HighestTierAllowed
 }
 
-// HardTopologyConstraint returns the complete hard topology constraint. Tier
-// names are intentionally preserved because their numeric tier can differ
-// between topology branches.
+// HardTopologyConstraint returns the configured hard topology constraint without
+// validating its boundary. Tier names are intentionally preserved because their
+// numeric tier can differ between topology branches.
 func (ji *JobInfo) HardTopologyConstraint() *scheduling.NetworkTopologySpec {
 	if ji.NetworkTopology == nil || ji.NetworkTopology.Mode != scheduling.HardNetworkTopologyMode {
-		return nil
-	}
-	if ji.NetworkTopology.HighestTierAllowed == nil && ji.NetworkTopology.HighestTierName == "" {
 		return nil
 	}
 	return ji.NetworkTopology

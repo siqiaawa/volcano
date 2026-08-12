@@ -17,6 +17,7 @@ limitations under the License.
 package hypernode
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -50,6 +51,8 @@ func init() {
 const (
 	name = "hyperNode-controller"
 )
+
+var errStaleDiscoveryResult = errors.New("stale discovery result")
 
 type hyperNodeController struct {
 	vcClient          vcclientset.Interface
@@ -192,7 +195,12 @@ func (hn *hyperNodeController) processNextDiscoveryResult() bool {
 		return true
 	}
 
-	if err := hn.reconcileTopology(result.Source, result.HyperNodes); err != nil {
+	if err := hn.reconcileTopology(result); err != nil {
+		if errors.Is(err, errStaleDiscoveryResult) {
+			result.Ack()
+			hn.discoveryResultQueue.Forget(result)
+			return true
+		}
 		hn.discoveryResultQueue.AddRateLimited(result)
 		klog.ErrorS(err, "Failed to reconcile discovered HyperNodes; will retry",
 			"source", result.Source, "generation", result.Generation)
@@ -205,7 +213,9 @@ func (hn *hyperNodeController) processNextDiscoveryResult() bool {
 }
 
 // reconcileTopology reconciles the discovered topology with existing HyperNode resources
-func (hn *hyperNodeController) reconcileTopology(source string, discoveredNodes []*topologyv1alpha1.HyperNode) error {
+func (hn *hyperNodeController) reconcileTopology(result *discovery.Result) error {
+	source := result.Source
+	discoveredNodes := result.HyperNodes
 	klog.InfoS("Starting topology reconciliation", "source", source, "discoveredNodeCount", len(discoveredNodes))
 
 	existingNodes, err := hn.hyperNodeLister.List(labels.SelectorFromSet(labels.Set{
@@ -274,6 +284,9 @@ func (hn *hyperNodeController) reconcileTopology(source string, discoveredNodes 
 
 		delete(existingNodeMap, name)
 	}
+	if !result.IsCurrent() {
+		return errStaleDiscoveryResult
+	}
 
 	orderedDeletes := make([]*topologyv1alpha1.HyperNode, 0, len(existingNodeMap))
 	for _, node := range existingNodeMap {
@@ -286,6 +299,9 @@ func (hn *hyperNodeController) reconcileTopology(source string, discoveredNodes 
 		return orderedDeletes[i].Name < orderedDeletes[j].Name
 	})
 	for _, node := range orderedDeletes {
+		if !result.IsCurrent() {
+			return errStaleDiscoveryResult
+		}
 		klog.InfoS("Deleting HyperNode", "name", node.Name, "source", source)
 		if err := utils.DeleteHyperNode(hn.vcClient, node.Name); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete HyperNode %s: %w", node.Name, err)

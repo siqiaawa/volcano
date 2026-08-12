@@ -98,7 +98,9 @@ data:
 Clusters that contain multiple topology structures should use the profile form of
 `networkTopologyTypes`. A profile separates the node label used to identify a
 physical network domain (`nodeLabel`) from the semantic boundary exposed to the
-scheduler (`tierName`). A node must match exactly one profile.
+scheduler (`tierName`). A node may match at most one explicit profile; multiple
+explicit matches are rejected. If no explicit profile matches, selector-less
+legacy profiles retain the legacy discovery behavior.
 
 The following configuration generates two independent HyperNode trees with
 different depths. It allows `highestTierName: volcano.sh/hypernode` to select
