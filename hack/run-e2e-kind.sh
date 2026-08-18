@@ -82,12 +82,6 @@ function install-kwok-nodes() {
   for i in $(seq 0 $((node_count-1))); do
     create-kwok-node $i
   done
-
-  # Do not create test pods until KWOK has fully started managing every fake node.
-  if ! kubectl wait --for=condition=Ready node -l type=kwok --timeout=120s; then
-    echo "ERROR: KWOK nodes did not become Ready within 120s"
-    return 1
-  fi
 }
 
 function install-volcano {
@@ -436,8 +430,8 @@ else
 
     check-prerequisites
     kind-up-cluster
-    install-kwok-with-helm || exit 1
-    install-volcano || exit 1
+    install-kwok-with-helm
+    install-volcano
 fi
 
 # Run e2e test
@@ -502,7 +496,7 @@ case ${E2E_TYPE} in
     ;;
 "HYPERNODE")
     echo "Creating 8 kwok nodes for 3-tier topology"
-    install-kwok-nodes 8 || exit 1
+    install-kwok-nodes 8
     echo "Running hypernode e2e suite..."
     KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -r --slow-spec-threshold='30s' --progress ./test/e2e/hypernode/
     ;;
@@ -525,7 +519,7 @@ case ${E2E_TYPE} in
     ;;
 "GANGEVICT")
     echo "Creating 4 kwok nodes for gang eviction topology tests"
-    install-kwok-nodes 4 || exit 1
+    install-kwok-nodes 4
     echo "Running gang eviction e2e suite..."
     KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -v -r --slow-spec-threshold='30s' --progress ./test/e2e/gangevict/
     ;;

@@ -14,36 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-KWOK_CHART_VERSION=${KWOK_CHART_VERSION:-0.3.0}
-KWOK_IMAGE=${KWOK_IMAGE:-registry.k8s.io/kwok/kwok:v0.8.0}
-
-function load-single-platform-image-to-kind {
-  local image=$1
-  local platform
-  local nodes
-  local archive
-
-  platform=$(docker image inspect "${image}" --format '{{.Os}}/{{.Architecture}}') || return 1
-  nodes=$(kind get nodes "${CLUSTER_CONTEXT[@]}") || return 1
-  archive=$(mktemp) || return 1
-
-  if ! docker image save -o "${archive}" "${image}"; then
-    rm -f "${archive}"
-    return 1
-  fi
-
-  for node in ${nodes}; do
-    echo "Loading ${image} into ${node} for ${platform}"
-    if ! docker exec --privileged -i "${node}" ctr --namespace=k8s.io images import \
-      --platform="${platform}" --digests --snapshotter=overlayfs - < "${archive}" >/dev/null; then
-      rm -f "${archive}"
-      return 1
-    fi
-  done
-
-  rm -f "${archive}"
-}
-
 # spin up cluster with kind command
 function kind-up-cluster {
   check-kind
@@ -57,21 +27,12 @@ function kind-up-cluster {
   echo
   echo "Loading docker images into kind cluster"
   # only need to load images into control-plane node because volcano components are deployed on control-plane node.
-  kind load docker-image ${IMAGE_PREFIX}/vc-controller-manager:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane || exit 1
-  kind load docker-image ${IMAGE_PREFIX}/vc-scheduler:${TAG}          "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane || exit 1
-  kind load docker-image ${IMAGE_PREFIX}/vc-webhook-manager:${TAG}    "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane || exit 1
+  kind load docker-image ${IMAGE_PREFIX}/vc-controller-manager:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
+  kind load docker-image ${IMAGE_PREFIX}/vc-scheduler:${TAG}          "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
+  kind load docker-image ${IMAGE_PREFIX}/vc-webhook-manager:${TAG}    "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
   if [[ "${E2E_TYPE}" == AGENTSCHEDULER* ]]; then
-    kind load docker-image ${IMAGE_PREFIX}/vc-agent-scheduler:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane || exit 1
+    kind load docker-image ${IMAGE_PREFIX}/vc-agent-scheduler:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
   fi
-
-  echo
-  echo "Ensuring KWOK image is available on all kind nodes"
-  if ! docker image inspect "${KWOK_IMAGE}" >/dev/null 2>&1; then
-    echo "Pulling image ${KWOK_IMAGE} ..."
-    docker pull "${KWOK_IMAGE}" >/dev/null || exit 1
-  fi
-  load-single-platform-image-to-kind "${KWOK_IMAGE}" || exit 1
-
   if [[ "${E2E_TYPE}" == "DRA" || "${E2E_TYPE}" == "ALL" ]]; then
     ensure-dra-test-images
   fi
@@ -215,35 +176,10 @@ function install-ginkgo-if-not-exist {
 }
 
 function install-kwok-with-helm {
-  local chart_cache_dir=${KWOK_CHART_CACHE_DIR:-${HOME}/.cache/volcano-e2e/helm}
-  local helm_repository_cache
-  local kwok_chart=${chart_cache_dir}/kwok-${KWOK_CHART_VERSION}.tgz
-  local stage_chart=${chart_cache_dir}/stage-fast-${KWOK_CHART_VERSION}.tgz
-
-  mkdir -p "${chart_cache_dir}" || return 1
-  helm_repository_cache=$(helm env HELM_REPOSITORY_CACHE) || return 1
-
-  # Reuse charts Helm downloaded during an earlier run before accessing GitHub again.
-  if [[ ! -f "${kwok_chart}" && -f "${helm_repository_cache}/kwok-chart-${KWOK_CHART_VERSION}.tgz" ]]; then
-    cp "${helm_repository_cache}/kwok-chart-${KWOK_CHART_VERSION}.tgz" "${kwok_chart}" || return 1
-  fi
-  if [[ ! -f "${stage_chart}" && -f "${helm_repository_cache}/kwok-stage-fast-chart-${KWOK_CHART_VERSION}.tgz" ]]; then
-    cp "${helm_repository_cache}/kwok-stage-fast-chart-${KWOK_CHART_VERSION}.tgz" "${stage_chart}" || return 1
-  fi
-
-  if [[ ! -f "${kwok_chart}" || ! -f "${stage_chart}" ]]; then
-    helm repo add kwok https://kwok.sigs.k8s.io/charts/ --force-update || return 1
-    helm repo update || return 1
-  fi
-  if [[ ! -f "${kwok_chart}" ]]; then
-    helm pull kwok/kwok --version "${KWOK_CHART_VERSION}" --destination "${chart_cache_dir}" || return 1
-  fi
-  if [[ ! -f "${stage_chart}" ]]; then
-    helm pull kwok/stage-fast --version "${KWOK_CHART_VERSION}" --destination "${chart_cache_dir}" || return 1
-  fi
-
-  helm upgrade --namespace kube-system --install kwok "${kwok_chart}" --wait --timeout 2m || return 1
-  helm upgrade --install kwok "${stage_chart}" || return 1
+  helm repo add kwok https://kwok.sigs.k8s.io/charts/
+  helm repo update
+  helm upgrade --namespace kube-system --install kwok kwok/kwok
+  helm upgrade --install kwok kwok/stage-fast
   # delete pod-complete stage to avoid volcano-job-pod change status to complete.
-  kubectl delete stage pod-complete || return 1
+  kubectl delete stage pod-complete
 }
